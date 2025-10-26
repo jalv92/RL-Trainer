@@ -12,11 +12,38 @@ Optimized for: RunPod RTX 4000 Ada deployment
 """
 
 import os
+
+# Limit math/BLAS thread pools before heavy numerical imports to avoid exhausting
+# pthread limits on constrained systems.
+try:
+    _THREAD_LIMIT_INT = max(1, int(os.environ.get("TRAINER_MAX_BLAS_THREADS", "1")))
+except ValueError:
+    _THREAD_LIMIT_INT = 1
+_THREAD_LIMIT_STR = str(_THREAD_LIMIT_INT)
+
+for _env_var in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_env_var, _THREAD_LIMIT_STR)
+
 import sys
 import glob
 import torch
 import numpy as np
 import pandas as pd
+
+_TORCH_THREADS_OVERRIDE = os.environ.get("PYTORCH_NUM_THREADS")
+try:
+    if _TORCH_THREADS_OVERRIDE is not None:
+        torch.set_num_threads(max(1, int(_TORCH_THREADS_OVERRIDE)))
+    else:
+        torch.set_num_threads(_THREAD_LIMIT_INT)
+except (TypeError, ValueError):
+    torch.set_num_threads(1)
 from stable_baselines3 import PPO
 # RL FIX #4: Import MaskablePPO for action masking support
 from sb3_contrib import MaskablePPO
@@ -62,6 +89,29 @@ def safe_print(message=""):
             ascii_message = ascii_message.replace(src, target)
         ascii_message = ascii_message.encode('ascii', errors='ignore').decode('ascii')
         print(ascii_message)
+
+
+def get_effective_num_envs(requested_envs: int) -> int:
+    """Determine a safe number of parallel environments for this host."""
+    override = os.environ.get("TRAINER_NUM_ENVS")
+    if override:
+        try:
+            value = max(1, int(override))
+            safe_print(f"[CONFIG] TRAINER_NUM_ENVS override detected: {value}")
+            return value
+        except ValueError:
+            safe_print(f"[WARN] Ignoring invalid TRAINER_NUM_ENVS='{override}'")
+
+    cpu_count = os.cpu_count()
+    if cpu_count:
+        cpu_aligned = max(1, cpu_count)
+        if requested_envs > cpu_aligned:
+            safe_print(
+                f"[SYSTEM] Reducing parallel envs to {cpu_aligned} (requested {requested_envs}, {cpu_count} CPU cores)"
+            )
+            return cpu_aligned
+
+    return requested_envs
 
 
 # Check progress bar availability
@@ -597,7 +647,14 @@ def train_phase2():
     safe_print("PHASE 2: POSITION MANAGEMENT MASTERY")
     safe_print("=" * 80)
     safe_print(f"[CONFIG] Total timesteps: {PHASE2_CONFIG['total_timesteps']:,}")
-    safe_print(f"[CONFIG] Parallel envs: {PHASE2_CONFIG['num_envs']}")
+    requested_envs = PHASE2_CONFIG['num_envs']
+    num_envs = get_effective_num_envs(requested_envs)
+    safe_print(f"[CONFIG] Parallel envs (requested): {requested_envs}")
+    if num_envs != requested_envs:
+        safe_print(f"[CONFIG] Parallel envs (effective): {num_envs} (adjusted for host limits)")
+    else:
+        safe_print(f"[CONFIG] Parallel envs (effective): {num_envs}")
+    safe_print(f"[SYSTEM] BLAS threads per process: {os.environ.get('OPENBLAS_NUM_THREADS', 'unknown')}")
     safe_print(f"[CONFIG] Network: {PHASE2_CONFIG['policy_layers']}")
     safe_print(f"[CONFIG] Action space: 9 (RL Fix #9: split toggle -> enable/disable)")
     safe_print(f"[CONFIG] Device: {PHASE2_CONFIG['device']}")
@@ -615,10 +672,10 @@ def train_phase2():
     train_data, val_data, train_second_data, val_second_data = load_data(train_split=0.7)
 
     # Create vectorized TRAINING environments (use TRAIN data only)
-    safe_print(f"\n[ENV] Creating {PHASE2_CONFIG['num_envs']} Phase 2 TRAINING environments...")
-    env_fns = [make_env(train_data, train_second_data, i, PHASE2_CONFIG) for i in range(PHASE2_CONFIG['num_envs'])]
+    safe_print(f"\n[ENV] Creating {num_envs} Phase 2 TRAINING environments...")
+    env_fns = [make_env(train_data, train_second_data, i, PHASE2_CONFIG) for i in range(num_envs)]
 
-    if PHASE2_CONFIG['num_envs'] > 1:
+    if num_envs > 1:
         env = SubprocVecEnv(env_fns)
     else:
         env = DummyVecEnv(env_fns)
