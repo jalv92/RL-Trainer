@@ -1,4 +1,4 @@
-# RL TRAINER - AI Trading System
+# AI - TRAINER - AI Trading System
 
 A comprehensive reinforcement learning trading system with an interactive command-line interface for managing the complete ML pipeline from data processing to model evaluation.
 
