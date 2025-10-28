@@ -89,6 +89,13 @@ results/*
 *.pdf
 *.svg
 
+# Exception: Allow documentation images
+!img/*.png
+!img/*.jpg
+!img/*.jpeg
+!docs/**/*.png
+!docs/**/*.jpg
+
 # OS
 .DS_Store
 Thumbs.db
