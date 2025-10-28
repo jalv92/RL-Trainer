@@ -147,3 +147,8 @@ docs/.doctrees/
 
 # Keep instruction file
 !logs/.instructions_shown
+
+# Exclude Twitter/X marketing content
+docs/twitter_thread_content.md
+docs/twitter_thread_content_ES.md
+docs/x_posts.md
