@@ -25,6 +25,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# Import model utilities
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from model_utils import detect_models_in_folder, display_model_selection
+
 # Try to import colorama for colored output
 try:
     from colorama import init, Fore, Style
@@ -94,7 +98,8 @@ class RLTrainerMenu:
         self.training_menu_options = {
             "1": "Training Test (Local Testing)",
             "2": "Training Pod (Production)",
-            "3": "Back to Main Menu"
+            "3": "Continue from Existing Model",
+            "4": "Back to Main Menu"
         }
     
     def setup_logging(self):
@@ -216,13 +221,13 @@ class RLTrainerMenu:
         print(f"{Colors.BOLD}{Colors.CYAN}║                      TRAINING MENU                            ║{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
         print()
-        
+
         for key, value in self.training_menu_options.items():
-            if key == "3":  # Back option
+            if key == "4":  # Back option
                 print(f"{Colors.YELLOW}  {key}. {value}{Colors.RESET}")
             else:
                 print(f"{Colors.GREEN}  {key}. {value}{Colors.RESET}")
-        
+
         print()
     
     def get_user_input(self, prompt: str, valid_options: Optional[List[str]] = None) -> Optional[str]:
@@ -593,7 +598,7 @@ class RLTrainerMenu:
         print(f"\n{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.CYAN}║                      TRAINING MODEL                             ║{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
-        
+
         while True:
             self.display_training_menu()
             choice = self.get_user_input(
@@ -612,6 +617,9 @@ class RLTrainerMenu:
                 self.run_training_production()
                 break
             elif choice == "3":
+                self.continue_from_model()
+                break
+            elif choice == "4":
                 print(f"{Colors.YELLOW}Returning to main menu...{Colors.RESET}")
                 break
             else:
@@ -715,7 +723,98 @@ class RLTrainerMenu:
         print(f"\n{Colors.GREEN}✓ Production training completed successfully!{Colors.RESET}")
         print(f"{Colors.CYAN}Models saved in models/{Colors.RESET}")
         return True
-    
+
+    def continue_from_model(self):
+        """Continue training from an existing model in the models folder."""
+        print(f"\n{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}║                CONTINUE TRAINING FROM MODEL                   ║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
+
+        # Detect available Phase 1 models
+        print(f"\n{Colors.CYAN}Scanning for available Phase 1 models...{Colors.RESET}")
+        models = detect_models_in_folder(phase='phase1')
+
+        # Display and get selection
+        selected_idx = display_model_selection(models, phase_filter='phase1')
+
+        if selected_idx == -1:
+            print(f"{Colors.YELLOW}No model selected. Returning to training menu...{Colors.RESET}")
+            return False
+
+        selected_model = models[selected_idx]
+
+        print(f"\n{Colors.GREEN}Selected model: {selected_model['name']}{Colors.RESET}")
+        print(f"{Colors.CYAN}Path: {selected_model['path']}{Colors.RESET}")
+
+        if not selected_model['vecnorm_path']:
+            print(f"\n{Colors.RED}⚠ Warning: No VecNormalize file found for this model!{Colors.RESET}")
+            print(f"{Colors.YELLOW}Training may not work correctly without normalization statistics.{Colors.RESET}")
+            confirm = self.get_user_input(
+                f"{Colors.YELLOW}Continue anyway? (y/n): {Colors.RESET}",
+                ["y", "n", "Y", "N"]
+            )
+            if confirm is None or confirm.lower() != 'y':
+                print(f"{Colors.YELLOW}Operation cancelled.{Colors.RESET}")
+                return False
+
+        # Ask for test or production mode
+        print(f"\n{Colors.CYAN}Select training mode:{Colors.RESET}")
+        print(f"{Colors.GREEN}  1. Test Mode (Local Testing - reduced timesteps){Colors.RESET}")
+        print(f"{Colors.GREEN}  2. Production Mode (Full Training){Colors.RESET}")
+
+        mode_choice = self.get_user_input(
+            f"{Colors.YELLOW}Select mode (1 or 2): {Colors.RESET}",
+            ["1", "2"]
+        )
+
+        if mode_choice is None:
+            print(f"{Colors.YELLOW}Operation cancelled.{Colors.RESET}")
+            return False
+
+        test_mode = (mode_choice == "1")
+        mode_name = "Test" if test_mode else "Production"
+
+        # Confirm
+        print(f"\n{Colors.BOLD}{Colors.YELLOW}CONFIRMATION{Colors.RESET}")
+        print(f"{Colors.CYAN}Model: {selected_model['name']}{Colors.RESET}")
+        print(f"{Colors.CYAN}Mode: {mode_name}{Colors.RESET}")
+
+        confirm = self.get_user_input(
+            f"{Colors.YELLOW}Proceed with continuing training? (y/n): {Colors.RESET}",
+            ["y", "n", "Y", "N"]
+        )
+
+        if confirm is None or confirm.lower() != 'y':
+            print(f"{Colors.YELLOW}Training cancelled.{Colors.RESET}")
+            return False
+
+        # Run Phase 1 training with continuation
+        phase1_script = self.src_dir / "train_phase1.py"
+        if not phase1_script.exists():
+            print(f"{Colors.RED}Error: Phase 1 training script not found!{Colors.RESET}")
+            return False
+
+        print(f"\n{Colors.GREEN}Starting Phase 1 Continuation Training ({mode_name} Mode)...{Colors.RESET}")
+
+        # Build command with --continue flag
+        command = [sys.executable, str(phase1_script), "--continue", "--model-path", selected_model['path']]
+        if test_mode:
+            command.append("--test")
+
+        success, output = self.run_command_with_progress(
+            command,
+            f"Phase 1 Continuation Training ({mode_name})",
+            f"training_phase1_continue_{mode_name.lower()}.log"
+        )
+
+        if not success:
+            print(f"{Colors.RED}Phase 1 continuation training failed.{Colors.RESET}")
+            return False
+
+        print(f"\n{Colors.GREEN}✓ Continuation training completed successfully!{Colors.RESET}")
+        print(f"{Colors.CYAN}Updated model saved in models/{Colors.RESET}")
+        return True
+
     def run_evaluation(self):
         """Run model evaluation."""
         print(f"\n{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")

@@ -1,5 +1,7 @@
 # RL TRAINER - AI Trading System
 
+![RL TRAINER Main Menu](img/Screenshot_105.png)
+
 A comprehensive reinforcement learning trading system with an interactive command-line interface for managing the complete ML pipeline from data processing to model evaluation.
 
 ## Overview
@@ -12,12 +14,16 @@ This project implements a two-phase curriculum learning approach for training tr
 - **Two-Phase Training Pipeline** - Curriculum learning approach
   - Phase 1: Entry signal quality learning (fixed SL/TP)
   - Phase 2: Position management with dynamic SL/TP
+- **Continue Training from Checkpoint** - Resume training from any saved model
+- **Smart Model Detection** - Automatically finds and loads the newest models
 - **Data Processing** - Support for 8 major futures instruments
 - **Model Evaluation** - Comprehensive performance metrics
 - **Compliance Enforcement** - 100% Apex Trader Funding rules compliance
 - **Progress Tracking** - Colored output and detailed logging
 
 ## Supported Instruments
+
+![Data Processing Menu](img/Screenshot_106.png)
 
 - **NQ** - Nasdaq 100 E-mini
 - **ES** - S&P 500 E-mini
@@ -44,6 +50,7 @@ AI Trainer/
 │   ├── feature_engineering.py   # Feature extraction
 │   ├── technical_indicators.py  # Technical indicators
 │   ├── kl_callback.py           # KL divergence monitoring
+│   ├── model_utils.py           # Model detection and loading utilities
 │   ├── train_phase1.py          # Phase 1 training script
 │   ├── train_phase2.py          # Phase 2 training script
 │   ├── evaluate_phase2.py       # Model evaluation
@@ -64,6 +71,9 @@ AI Trainer/
 │   └── .gitkeep
 │
 ├── tensorboard_logs/            # TensorBoard logs
+│   └── .gitkeep
+│
+├── img/                         # Screenshots and images
 │   └── .gitkeep
 │
 ├── tests/                       # Test suite
@@ -106,7 +116,7 @@ pip install -r requirements.txt
 python -c "import gymnasium, stable_baselines3, pandas, numpy; print('✓ All core dependencies installed')"
 
 # Or run the verification script
-python test_setup.py
+python tests/test_setup.py
 ```
 
 ## Quick Start
@@ -117,12 +127,46 @@ python test_setup.py
 python main.py
 ```
 
-The interactive menu provides 4 main options:
+The interactive menu provides 5 main options:
 
 1. **Requirements Installation** - Install all dependencies
 2. **Data Processing** - Process market data for training
 3. **Training Model** - Train Phase 1 and Phase 2 models
+   - Training Test (Local Testing)
+   - Training Pod (Production)
+   - **Continue from Existing Model** ⭐ NEW
 4. **Evaluator** - Evaluate trained models
+5. **Exit** - Close the program
+
+![Evaluator Menu](img/Screenshot_107.png)
+
+### Continue Training Feature ⭐ NEW
+
+Resume training from any previously saved model:
+
+```bash
+python main.py
+# Select 3: Training Model
+# Select 3: Continue from Existing Model
+# Choose from list of available models
+# Select test or production mode
+```
+
+**Benefits:**
+- Resume interrupted training sessions
+- Extend training for models that haven't converged
+- Continue training with different hyperparameters
+- No need to remember model names - automatic detection
+- Preserves timestep count and training progress
+
+**Command-line usage:**
+```bash
+# Continue training from a specific model
+python src/train_phase1.py --continue --model-path models/phase1_foundational_final.zip
+
+# Continue in test mode
+python src/train_phase1.py --continue --model-path models/phase1_foundational_final.zip --test
+```
 
 ### Manual Workflow
 
@@ -137,10 +181,10 @@ Available markets: NQ, ES, YM, RTY, MNQ, MES, M2K, MYM
 #### 2. Train Models
 
 ```bash
-# Phase 1: Entry Signal Learning (5M timesteps)
+# Phase 1: Entry Signal Learning (2M timesteps)
 python src/train_phase1.py
 
-# Phase 2: Position Management (5M timesteps)
+# Phase 2: Position Management (5M timesteps with transfer learning)
 python src/train_phase2.py
 ```
 
@@ -172,9 +216,10 @@ Phase 1: Entry Signal Learning
   ├─ Fixed SL/TP (1.5x ATR SL, 3:1 ratio)
   ├─ 3 actions: Hold, Buy, Sell
   ├─ Focus: Entry signal quality
-  └─ Duration: 5M timesteps (~6-8 hours on RTX 4000)
+  └─ Duration: 2M timesteps (~6-8 hours on RTX 4000)
 
 Phase 2: Position Management (Transfer Learning)
+  ├─ Auto-loads newest Phase 1 model
   ├─ Inherit Phase 1 weights
   ├─ Dynamic SL/TP adjustment
   ├─ 9 actions: Complex position management
@@ -214,7 +259,7 @@ See `docs/Apex-Rules.md` for complete compliance details.
 
 ```python
 PHASE1_CONFIG = {
-    'total_timesteps': 5_000_000,
+    'total_timesteps': 2_000_000,
     'num_envs': 80,
     'learning_rate': 3e-4,
     'batch_size': 512,
@@ -228,8 +273,8 @@ PHASE1_CONFIG = {
 PHASE2_CONFIG = {
     'total_timesteps': 5_000_000,
     'num_envs': 80,
-    'learning_rate': 1e-4,
-    'batch_size': 256,
+    'learning_rate': 3e-4,
+    'batch_size': 512,
     'device': 'cuda'  # or 'cpu'
 }
 ```
@@ -302,6 +347,13 @@ Ensure TensorTrade is installed:
 python setup.py install
 ```
 
+### Model Not Found
+
+If Phase 2 can't find Phase 1 model:
+- The system now auto-detects the newest Phase 1 model
+- Ensure you've completed Phase 1 training
+- Check `models/` directory for Phase 1 models
+
 ## Performance Metrics
 
 Target metrics for successful training:
@@ -329,6 +381,8 @@ Target metrics for successful training:
 - Ensure sufficient disk space (>10GB for full training)
 - Use test mode (`--test` flag) for quick validation
 - Monitor GPU/CPU usage during training
+- Use "Continue Training" to resume interrupted sessions
+- Phase 2 automatically finds your newest Phase 1 model
 
 ## Common Workflows
 
@@ -345,7 +399,7 @@ python main.py
 ```bash
 python main.py
 # Select 3: Training Model → 2: Training Pod (Production)
-# Wait for completion (~16-18 hours total)
+# Wait for completion (~14-18 hours total)
 # Select 4: Evaluator
 ```
 
@@ -358,12 +412,23 @@ python main.py
 # Select 4: Evaluator
 ```
 
+### 4. Resume Training (NEW)
+
+```bash
+python main.py
+# Select 3: Training Model → 3: Continue from Existing Model
+# Select model from list
+# Choose test or production mode
+# Training continues from checkpoint
+```
+
 ## Technology Stack
 
 - **RL Framework**: Stable Baselines3 (PPO algorithm)
+- **Action Masking**: sb3-contrib (MaskablePPO)
 - **Environment**: Gymnasium API
 - **Trading Library**: TensorTrade
-- **Deep Learning**: TensorFlow 2.15+
+- **Deep Learning**: PyTorch 2.0+
 - **Data Processing**: Pandas, NumPy
 - **Visualization**: Matplotlib, Plotly, TensorBoard
 - **UI**: Colorama, tqdm, rich
@@ -379,23 +444,46 @@ Apache License 2.0 (inherited from TensorTrade)
 3. Update documentation for new features
 4. Ensure Apex compliance for any trading logic changes
 
-## Support
+## Support & Contact
 
-For issues and questions:
+For questions, suggestions, or discussions:
+
+**X (Twitter)**: [@javiertradess](https://x.com/javiertradess)
+
+For technical issues:
 1. Check logs in `logs/` directory
 2. Review `docs/Apex-Rules.md` for compliance questions
 3. Run tests to diagnose issues: `pytest tests/ -v`
 
 ## Version
 
-RL TRAINER v1.0.0 - October 2025
+**RL TRAINER v1.0.0** - October 2025
 Based on TensorTrade v1.0.4-dev1
 
 ## Author
 
-RL Trading System Team
+Javier - [@javiertradess](https://x.com/javiertradess)
 
 ---
 
 **Getting Started**: Run `python main.py` and follow the interactive menu!
-# RL-Trainer
+
+## Recent Updates
+
+### Continue Training Feature (Latest)
+- ✅ Resume training from any saved model
+- ✅ Smart model detection - no need to remember filenames
+- ✅ Test and production modes supported
+- ✅ Preserves timestep count and training progress
+- ✅ Custom save names after training completion
+- ✅ Phase 2 auto-detects newest Phase 1 model
+
+### System Optimizations
+- ✅ Thread pool management for stable training on constrained systems
+- ✅ Improved multi-environment handling
+- ✅ Enhanced error messages and diagnostics
+- ✅ VecNormalize state preservation
+
+---
+
+**Star this repo if you find it useful!** ⭐

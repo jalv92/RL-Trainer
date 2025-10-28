@@ -52,6 +52,7 @@ from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback,
 from environment_phase1 import TradingEnvironmentPhase1
 from kl_callback import KLDivergenceCallback
 from feature_engineering import add_market_regime_features
+from model_utils import get_model_save_name
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -383,11 +384,22 @@ def make_env(data, second_data, env_id, config):
     return _init
 
 
-def train_phase1():
-    """Execute Phase 1 training."""
-    safe_print("=" * 80)
-    safe_print("PHASE 1: FOUNDATIONAL TRADING PATTERNS")
-    safe_print("=" * 80)
+def train_phase1(continue_training=False, model_path=None):
+    """Execute Phase 1 training.
+
+    Args:
+        continue_training: If True, load and continue training from existing model
+        model_path: Path to existing model to continue from
+    """
+    if continue_training:
+        safe_print("=" * 80)
+        safe_print("PHASE 1: CONTINUING TRAINING FROM EXISTING MODEL")
+        safe_print("=" * 80)
+        safe_print(f"[MODEL] Loading model from: {model_path}")
+    else:
+        safe_print("=" * 80)
+        safe_print("PHASE 1: FOUNDATIONAL TRADING PATTERNS")
+        safe_print("=" * 80)
     safe_print(f"[CONFIG] Total timesteps: {PHASE1_CONFIG['total_timesteps']:,}")
     requested_envs = PHASE1_CONFIG['num_envs']
     num_envs = get_effective_num_envs(requested_envs)
@@ -456,39 +468,57 @@ def train_phase1():
         )
         safe_print("[TRAIN] Using linear learning rate schedule")
     
-    # Create PPO model
-    safe_print("\n[MODEL] Creating PPO model...")
-    safe_print(f"[MODEL] Policy network: {PHASE1_CONFIG['policy_layers']}")
-    safe_print(f"[MODEL] Initial learning rate: {PHASE1_CONFIG['learning_rate']}")
-    safe_print(f"[MODEL] Batch size: {PHASE1_CONFIG['batch_size']} (INCREASED)")
-    safe_print(f"[MODEL] PPO clip range: {PHASE1_CONFIG['clip_range']}")
+    # Create or load PPO model
+    if continue_training and model_path:
+        safe_print("\n[MODEL] Loading existing PPO model...")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found at: {model_path}")
 
-    model = PPO(
-        'MlpPolicy',
-        env,
-        learning_rate=learning_rate,
-        n_steps=PHASE1_CONFIG['n_steps'],
-        batch_size=PHASE1_CONFIG['batch_size'],
-        n_epochs=PHASE1_CONFIG['n_epochs'],
-        gamma=PHASE1_CONFIG['gamma'],
-        gae_lambda=PHASE1_CONFIG['gae_lambda'],
-        clip_range=PHASE1_CONFIG['clip_range'],
-        ent_coef=PHASE1_CONFIG['ent_coef'],
-        vf_coef=PHASE1_CONFIG['vf_coef'],
-        max_grad_norm=PHASE1_CONFIG['max_grad_norm'],
-        policy_kwargs={
-            'net_arch': dict(
-                pi=PHASE1_CONFIG['policy_layers'],
-                vf=PHASE1_CONFIG['policy_layers']
-            ),
-            'activation_fn': torch.nn.ReLU
-        },
-        device=PHASE1_CONFIG['device'],
-        verbose=1,
-        tensorboard_log='./tensorboard_logs/phase1/'
-    )
+        # Load the existing model
+        model = PPO.load(model_path, device=PHASE1_CONFIG['device'])
 
-    safe_print("[MODEL] PPO model created")
+        # Update the environment (important for VecNormalize)
+        model.set_env(env)
+
+        # Update tensorboard log directory
+        model.tensorboard_log = './tensorboard_logs/phase1/'
+
+        safe_print(f"[MODEL] Model loaded successfully from {model_path}")
+        safe_print(f"[MODEL] Current timesteps: {model.num_timesteps:,}")
+        safe_print(f"[MODEL] Will train for additional {PHASE1_CONFIG['total_timesteps']:,} timesteps")
+    else:
+        safe_print("\n[MODEL] Creating NEW PPO model...")
+        safe_print(f"[MODEL] Policy network: {PHASE1_CONFIG['policy_layers']}")
+        safe_print(f"[MODEL] Initial learning rate: {PHASE1_CONFIG['learning_rate']}")
+        safe_print(f"[MODEL] Batch size: {PHASE1_CONFIG['batch_size']} (INCREASED)")
+        safe_print(f"[MODEL] PPO clip range: {PHASE1_CONFIG['clip_range']}")
+
+        model = PPO(
+            'MlpPolicy',
+            env,
+            learning_rate=learning_rate,
+            n_steps=PHASE1_CONFIG['n_steps'],
+            batch_size=PHASE1_CONFIG['batch_size'],
+            n_epochs=PHASE1_CONFIG['n_epochs'],
+            gamma=PHASE1_CONFIG['gamma'],
+            gae_lambda=PHASE1_CONFIG['gae_lambda'],
+            clip_range=PHASE1_CONFIG['clip_range'],
+            ent_coef=PHASE1_CONFIG['ent_coef'],
+            vf_coef=PHASE1_CONFIG['vf_coef'],
+            max_grad_norm=PHASE1_CONFIG['max_grad_norm'],
+            policy_kwargs={
+                'net_arch': dict(
+                    pi=PHASE1_CONFIG['policy_layers'],
+                    vf=PHASE1_CONFIG['policy_layers']
+                ),
+                'activation_fn': torch.nn.ReLU
+            },
+            device=PHASE1_CONFIG['device'],
+            verbose=1,
+            tensorboard_log='./tensorboard_logs/phase1/'
+        )
+
+        safe_print("[MODEL] PPO model created")
 
     # Callbacks
     # STRATEGY B: Early stopping to prevent overfitting with limited data
@@ -566,7 +596,8 @@ def train_phase1():
         model.learn(
             total_timesteps=PHASE1_CONFIG['total_timesteps'],
             callback=callbacks,
-            progress_bar=use_progress_bar
+            progress_bar=use_progress_bar,
+            reset_num_timesteps=not continue_training  # Don't reset if continuing
         )
     except KeyboardInterrupt:
         safe_print("\n[TRAIN] Training interrupted by user")
@@ -577,17 +608,43 @@ def train_phase1():
 
     elapsed = time.time() - start_time
 
-    # Save final model
+    # Save final model with user-chosen name
     safe_print("\n[SAVE] Saving final Phase 1 model...")
-    model.save('models/phase1_foundational_final')
-    env.save('models/phase1_vecnorm.pkl')
+
+    # Determine default name
+    if continue_training:
+        # Extract base name from loaded model path
+        base_name = os.path.splitext(os.path.basename(model_path))[0]
+        default_name = f"{base_name}_continued"
+    else:
+        default_name = "phase1_foundational_final"
+
+    # Get save name from user (interactive mode only)
+    if sys.stdin.isatty():  # Check if running interactively
+        try:
+            save_name = get_model_save_name(default_name)
+        except:
+            # Fallback if there's an issue with the prompt
+            save_name = default_name
+            safe_print(f"[SAVE] Using default name: {save_name}")
+    else:
+        # Non-interactive mode (e.g., called from menu script)
+        save_name = default_name
+        safe_print(f"[SAVE] Non-interactive mode - using default name: {save_name}")
+
+    model_save_path = f'models/{save_name}'
+    vecnorm_save_path = f'models/{save_name}_vecnorm.pkl'
+
+    model.save(model_save_path)
+    env.save(vecnorm_save_path)
 
     safe_print("\n" + "=" * 80)
     safe_print("PHASE 1 TRAINING COMPLETE!")
     safe_print("=" * 80)
     safe_print(f"[RESULTS] Training time: {elapsed/3600:.2f} hours")
-    safe_print(f"[SAVE] Model: models/phase1_foundational_final.zip")
-    safe_print(f"[SAVE] VecNorm: models/phase1_vecnorm.pkl")
+    safe_print(f"[RESULTS] Total timesteps: {model.num_timesteps:,}")
+    safe_print(f"[SAVE] Model: {model_save_path}.zip")
+    safe_print(f"[SAVE] VecNorm: {vecnorm_save_path}")
     safe_print(f"[SAVE] Best model: models/phase1/best_model.zip")
     safe_print("")
     safe_print("[NEXT STEPS]")
@@ -604,6 +661,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Phase 1 Training')
     parser.add_argument('--test', action='store_true',
                        help='Run in test mode with reduced timesteps (30K for quick local testing)')
+    parser.add_argument('--continue', dest='continue_training', action='store_true',
+                       help='Continue training from an existing model')
+    parser.add_argument('--model-path', type=str, default=None,
+                       help='Path to the model to continue training from')
     args = parser.parse_args()
 
     # Override config for test mode (quick local testing)
@@ -627,8 +688,17 @@ if __name__ == '__main__':
         safe_print(f"[TEST] Purpose:         Verify pipeline works before full training")
         safe_print("=" * 80 + "\n")
 
+    # Validate continuation arguments
+    if args.continue_training and not args.model_path:
+        safe_print("\n[ERROR] --continue requires --model-path to be specified")
+        sys.exit(1)
+
+    if args.continue_training:
+        safe_print(f"\n[INFO] Continuation mode enabled")
+        safe_print(f"[INFO] Will load model from: {args.model_path}")
+
     # Set random seeds for reproducibility
     np.random.seed(42)
     torch.manual_seed(42)
 
-    train_phase1()
+    train_phase1(continue_training=args.continue_training, model_path=args.model_path)

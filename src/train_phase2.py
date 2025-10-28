@@ -53,6 +53,7 @@ from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback,
 from environment_phase2 import TradingEnvironmentPhase2
 from kl_callback import KLDivergenceCallback
 from feature_engineering import add_market_regime_features
+from model_utils import detect_models_in_folder
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -493,11 +494,34 @@ def load_phase1_and_transfer(config, env):
     """
     phase1_path = config['phase1_model_path']
 
+    # Auto-detect newest Phase 1 model if configured path doesn't exist
     if not os.path.exists(phase1_path):
-        safe_print(f"\n[WARNING] Phase 1 model not found at {phase1_path}")
-        safe_print("[WARNING] Starting Phase 2 from scratch (not recommended)")
-        safe_print("[WARNING] For best results, train Phase 1 first!")
-        return None
+        safe_print(f"\n[INFO] Configured Phase 1 model not found at {phase1_path}")
+        safe_print("[INFO] Auto-detecting newest Phase 1 model...")
+
+        # Detect all Phase 1 models
+        phase1_models = detect_models_in_folder(phase='phase1')
+
+        if not phase1_models:
+            safe_print("[WARNING] No Phase 1 models found in models directory")
+            safe_print("[WARNING] Starting Phase 2 from scratch (not recommended)")
+            safe_print("[WARNING] For best results, train Phase 1 first!")
+            return None
+
+        # Use the newest model (already sorted by modification time)
+        newest_model = phase1_models[0]
+        phase1_path = newest_model['path']
+
+        safe_print(f"[INFO] Found {len(phase1_models)} Phase 1 model(s)")
+        safe_print(f"[INFO] Using newest: {newest_model['name']}")
+        safe_print(f"[INFO] Modified: {newest_model['modified_str']}")
+
+        if len(phase1_models) > 1:
+            safe_print(f"[INFO] Other available models:")
+            for model in phase1_models[1:4]:  # Show up to 3 more
+                safe_print(f"       - {model['name']} ({model['modified_str']})")
+            if len(phase1_models) > 4:
+                safe_print(f"       ... and {len(phase1_models) - 4} more")
 
     safe_print(f"\n[TRANSFER] Loading Phase 1 model from {phase1_path}")
 
