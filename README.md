@@ -1,4 +1,4 @@
-# RL TRAINER - AI Trading System
+# AI - TRAINER - AI Trading System
 
 ![RL TRAINER Main Menu](img/Screenshot_105.png)
 
