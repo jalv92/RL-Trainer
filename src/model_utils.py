@@ -293,6 +293,127 @@ def validate_model_environment_compatibility(model_type: str, environment_type: 
     return False
 
 
+def detect_available_markets(data_dir='data'):
+    """
+    Detect all available market data files in the data directory.
+
+    Looks for files matching patterns:
+    - {MARKET}_D1M.csv (minute data)
+    - D1M.csv (generic)
+
+    Returns:
+        list: List of dicts with market info
+        Example: [
+            {'market': 'ES', 'minute_file': 'ES_D1M.csv', 'second_file': 'ES_D1S.csv', 'has_second': True},
+            {'market': 'NQ', 'minute_file': 'NQ_D1M.csv', 'second_file': None, 'has_second': False}
+        ]
+    """
+    markets = []
+
+    # Convert to absolute path
+    data_dir = os.path.abspath(data_dir)
+
+    # Pattern 1: Look for {MARKET}_D1M.csv files
+    pattern = os.path.join(data_dir, '*_D1M.csv')
+    minute_files = glob.glob(pattern)
+
+    for minute_file in minute_files:
+        basename = os.path.basename(minute_file)
+        market = basename.replace('_D1M.csv', '')
+
+        # Check for corresponding second-level file
+        second_file = os.path.join(data_dir, f'{market}_D1S.csv')
+        has_second = os.path.exists(second_file)
+
+        markets.append({
+            'market': market,
+            'minute_file': basename,
+            'second_file': f'{market}_D1S.csv' if has_second else None,
+            'has_second': has_second,
+            'path': os.path.abspath(minute_file)
+        })
+
+    # Pattern 2: Check for generic D1M.csv (no market prefix)
+    generic_minute = os.path.join(data_dir, 'D1M.csv')
+    if os.path.exists(generic_minute) and not any(m['market'] == 'GENERIC' for m in markets):
+        second_file = os.path.join(data_dir, 'D1S.csv')
+        has_second = os.path.exists(second_file)
+
+        markets.append({
+            'market': 'GENERIC',
+            'minute_file': 'D1M.csv',
+            'second_file': 'D1S.csv' if has_second else None,
+            'has_second': has_second,
+            'path': os.path.abspath(generic_minute)
+        })
+
+    return markets
+
+
+def select_market_for_training(markets, safe_print_func=print):
+    """
+    Prompt user to select a market for training.
+
+    Args:
+        markets: List of market dicts from detect_available_markets()
+        safe_print_func: Print function to use (for Windows compatibility)
+
+    Returns:
+        Selected market dict, or None if cancelled
+    """
+    if not markets:
+        safe_print_func("\n[ERROR] No market data files found!")
+        safe_print_func("[ERROR] Please run data processing first to create training data.")
+        return None
+
+    if len(markets) == 1:
+        # Only one dataset - use it automatically
+        market = markets[0]
+        safe_print_func(f"\n[DATA] Auto-detected: {market['market']} (only dataset available)")
+        safe_print_func(f"[DATA] Using: {market['minute_file']}")
+        if market['has_second']:
+            safe_print_func(f"[DATA] Second-level: {market['second_file']}")
+        return market
+
+    # Multiple datasets - prompt user
+    safe_print_func("\n" + "=" * 80)
+    safe_print_func("MARKET SELECTION")
+    safe_print_func("=" * 80)
+    safe_print_func(f"\nDetected {len(markets)} market datasets:\n")
+
+    for i, market in enumerate(markets, 1):
+        second_status = "[OK]" if market['has_second'] else "[MINUTE ONLY]"
+        safe_print_func(f"  {i}. {market['market']:<8} - {market['minute_file']:<20} {second_status}")
+
+    safe_print_func("\n" + "=" * 80)
+
+    while True:
+        try:
+            choice = input("\nSelect market number (or 'q' to quit): ").strip()
+
+            if choice.lower() == 'q':
+                safe_print_func("\n[INFO] Training cancelled by user")
+                return None
+
+            idx = int(choice) - 1
+            if 0 <= idx < len(markets):
+                selected = markets[idx]
+                safe_print_func(f"\n[DATA] Selected: {selected['market']}")
+                safe_print_func(f"[DATA] Minute data: {selected['minute_file']}")
+                if selected['has_second']:
+                    safe_print_func(f"[DATA] Second data: {selected['second_file']}")
+                else:
+                    safe_print_func(f"[DATA] Note: No second-level data available for {selected['market']}")
+                return selected
+            else:
+                safe_print_func(f"[ERROR] Invalid choice. Please enter 1-{len(markets)}")
+        except ValueError:
+            safe_print_func("[ERROR] Invalid input. Please enter a number or 'q'")
+        except KeyboardInterrupt:
+            safe_print_func("\n[INFO] Training cancelled by user")
+            return None
+
+
 if __name__ == "__main__":
     # Test the detection function
     print("Testing model detection...")

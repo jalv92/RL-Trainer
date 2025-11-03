@@ -52,7 +52,7 @@ from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback,
 from environment_phase1 import TradingEnvironmentPhase1
 from kl_callback import KLDivergenceCallback
 from feature_engineering import add_market_regime_features
-from model_utils import get_model_save_name
+from model_utils import get_model_save_name, detect_available_markets, select_market_for_training
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -194,11 +194,24 @@ def create_lr_schedule(initial_lr, final_fraction, total_timesteps):
         return initial_lr * (1 - progress * (1 - final_fraction))
     return lr_schedule
 
-def find_data_file():
-    """Find training data file with priority order."""
+def find_data_file(market=None):
+    """Find training data file with priority order.
+
+    Args:
+        market: Market identifier (e.g., 'ES', 'NQ') or None for auto-detect
+
+    Returns:
+        Path to data file
+    """
     # Get project root directory (parent of src/)
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(script_dir, 'data')
+
+    # If market is specified and not GENERIC, look for market-specific file first
+    if market and market != 'GENERIC':
+        market_file = os.path.join(data_dir, f'{market}_D1M.csv')
+        if os.path.exists(market_file):
+            return market_file
 
     # Priority order: D1M (generic 1-minute) > old ES-specific names (backward compat)
     filenames_to_try = [
@@ -226,17 +239,18 @@ def find_data_file():
     )
 
 
-def load_data(train_split=0.7):
+def load_data(train_split=0.7, market=None):
     """
     Load and prepare training data with proper train/val split.
 
     Args:
         train_split: Fraction of data to use for training (default 0.7 = 70%)
+        market: Market to load data for (e.g., 'ES', 'NQ', or None for auto-detect)
 
     Returns:
         train_data, val_data, train_second_data, val_second_data
     """
-    data_path = find_data_file()
+    data_path = find_data_file(market=market)
     safe_print(f"[DATA] Loading minute-level data from {data_path}")
 
     # Load minute-level data
@@ -283,13 +297,28 @@ def load_data(train_split=0.7):
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     second_data_candidates = []
 
+    # Try market-specific file first, then generic
+    if market and market != 'GENERIC':
+        second_data_candidates.append(os.path.join(script_dir, 'data', f'{market}_D1S.csv'))
+
+    # Add generic file
+    second_data_candidates.append(os.path.join(script_dir, 'data', 'D1S.csv'))
+
+    # Also check for wildcards in case market wasn't detected
     filename = os.path.basename(data_path)
     if filename.endswith('_D1M.csv') and len(filename) > len('_D1M.csv'):
         prefix = filename[:-len('_D1M.csv')]
         if prefix:
             second_data_candidates.append(os.path.join(script_dir, 'data', f"{prefix}_D1S.csv"))
 
-    second_data_candidates.append(os.path.join(script_dir, 'data', 'D1S.csv'))
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_candidates = []
+    for candidate in second_data_candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique_candidates.append(candidate)
+    second_data_candidates = unique_candidates
 
     second_data_path = None
     for candidate in second_data_candidates:
@@ -400,6 +429,20 @@ def train_phase1(continue_training=False, model_path=None):
         safe_print("=" * 80)
         safe_print("PHASE 1: FOUNDATIONAL TRADING PATTERNS")
         safe_print("=" * 80)
+
+    # Detect and select market
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dir = os.path.join(script_dir, 'data')
+    available_markets = detect_available_markets(data_dir)
+    selected_market = select_market_for_training(available_markets, safe_print)
+
+    if selected_market is None:
+        safe_print("\n[ERROR] No market selected. Exiting training.")
+        return  # User cancelled or no data
+
+    market_name = selected_market['market']
+    safe_print(f"\n[TRAINING] Market: {market_name}")
+
     safe_print(f"[CONFIG] Total timesteps: {PHASE1_CONFIG['total_timesteps']:,}")
     requested_envs = PHASE1_CONFIG['num_envs']
     num_envs = get_effective_num_envs(requested_envs)
@@ -422,7 +465,7 @@ def train_phase1(continue_training=False, model_path=None):
     os.makedirs('tensorboard_logs/phase1', exist_ok=True)
 
     # Load data with train/val split
-    train_data, val_data, train_second_data, val_second_data = load_data(train_split=0.7)
+    train_data, val_data, train_second_data, val_second_data = load_data(train_split=0.7, market=market_name)
 
     # Create vectorized training environments (use TRAIN data only)
     safe_print(f"\n[ENV] Creating {num_envs} parallel TRAINING environments...")
