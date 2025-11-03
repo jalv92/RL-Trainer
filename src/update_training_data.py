@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Automated Weekly ES Futures Data Update Pipeline
+Automated Weekly Futures Data Update Pipeline
 
 Automates the process of updating training data from GLBX .zip files:
 1. Detects GLBX-*.zip files in data/
@@ -12,11 +12,14 @@ Automates the process of updating training data from GLBX .zip files:
 6. Replaces old data files and cleans up
 
 Usage:
-    python update_training_data.py                # Standard update
+    python update_training_data.py --market NQ    # Process NQ (Nasdaq) data
+    python update_training_data.py --market ES    # Process ES (S&P 500) data
     python update_training_data.py --verbose      # Verbose logging
     python update_training_data.py --dry-run      # Test without modifying files
 
-Author: ES Futures Trading System
+Supported Markets: ES, NQ, YM, RTY, MNQ, MES, M2K, MYM
+
+Author: RL Futures Trading System
 Date: October 2025
 """
 
@@ -196,10 +199,14 @@ class DataUpdatePipeline:
 
             # Check for ES contracts
             if 'symbol' in df.columns:
-                # Filter for ES futures (ESU5, ESZ5, etc.)
-                es_contracts = [col for col in df['symbol'].unique() if col.startswith('ES')]
-                df = df[df['symbol'].isin(es_contracts)].copy()
-                safe_print(f"    Filtered to ES contracts: {len(df):,} rows")
+                # Filter for specified market futures (e.g., ES, NQ, YM, etc.)
+                if self.market:
+                    market_contracts = [col for col in df['symbol'].unique() if col.startswith(self.market)]
+                    df = df[df['symbol'].isin(market_contracts)].copy()
+                    safe_print(f"    Filtered to {self.market} contracts: {len(df):,} rows")
+                else:
+                    # If no market specified, try to detect from symbols
+                    safe_print(f"    No market filter applied: {len(df):,} rows")
 
             # Parse timestamp
             if 'ts_event' in df.columns:
@@ -291,7 +298,7 @@ class DataUpdatePipeline:
             # Step 1: Process raw second data
             raw_output = os.path.join(self.data_dir, self.second_raw_filename)
             safe_print("  Step 1: Processing raw second data...")
-            success = process_second_data.main(input_file=csv_file, output_path=raw_output)
+            success = process_second_data.main(input_file=csv_file, output_path=raw_output, market=self.market if self.market else 'ES')
 
             if not success:
                 safe_print("  ERROR: Failed to process second data")
@@ -455,7 +462,8 @@ class DataUpdatePipeline:
     def run(self):
         """Execute the complete data update pipeline"""
         safe_print("=" * 80)
-        safe_print("ES FUTURES WEEKLY DATA UPDATE")
+        market_label = f"{self.market} " if self.market else ""
+        safe_print(f"{market_label}FUTURES WEEKLY DATA UPDATE")
         safe_print("=" * 80)
 
         if self.dry_run:

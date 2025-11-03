@@ -28,40 +28,56 @@ def load_raw_second_data(file_path):
         return None
 
 
-def filter_es_contracts(df):
-    """Filter for ES futures contracts (ESU5, ESZ5)"""
-    print(f"\n[2/6] Filtering for ES futures contracts...")
+def filter_es_contracts(df, market='ES'):
+    """Filter for futures contracts based on market prefix (ES, NQ, YM, etc.)"""
+    print(f"\n[2/6] Filtering for {market} futures contracts...")
 
-    es_contracts = ['ESU5', 'ESZ5']
-    df_es = df[df['symbol'].isin(es_contracts)].copy()
+    # Get all unique symbols that start with the market prefix
+    market_symbols = [sym for sym in df['symbol'].unique() if str(sym).startswith(market)]
+    df_filtered = df[df['symbol'].isin(market_symbols)].copy()
 
-    print(f"      ESU5 records: {len(df_es[df_es['symbol'] == 'ESU5']):,}")
-    print(f"      ESZ5 records: {len(df_es[df_es['symbol'] == 'ESZ5']):,}")
-    print(f"      Total ES records: {len(df_es):,}")
+    # Display counts for each contract found
+    for symbol in sorted(market_symbols):
+        count = len(df_filtered[df_filtered['symbol'] == symbol])
+        print(f"      {symbol} records: {count:,}")
 
-    return df_es
+    print(f"      Total {market} records: {len(df_filtered):,}")
+
+    return df_filtered
 
 
-def create_continuous_contract(df_es):
-    """Create continuous ES data by handling contract rollover"""
+def create_continuous_contract(df_filtered):
+    """Create continuous contract data by handling contract rollovers"""
     print(f"\n[3/6] Creating continuous contract...")
 
     # Sort by timestamp
-    df_es = df_es.sort_values('ts_event')
+    df_filtered = df_filtered.sort_values('ts_event')
 
-    # Find rollover point
-    esu5_data = df_es[df_es['symbol'] == 'ESU5']
-    esz5_data = df_es[df_es['symbol'] == 'ESZ5']
+    # Get all unique contracts
+    unique_contracts = sorted(df_filtered['symbol'].unique())
 
-    if len(esu5_data) > 0 and len(esz5_data) > 0:
-        esu5_end = esu5_data['ts_event'].max()
-        esz5_start = esz5_data['ts_event'].min()
-        print(f"      ESU5 ends: {esu5_end}")
-        print(f"      ESZ5 starts: {esz5_start}")
+    if len(unique_contracts) == 0:
+        print("      WARNING: No contracts found")
+        return df_filtered
 
-    # Combine (ESU5 first, then ESZ5)
-    df_continuous = pd.concat([esu5_data, esz5_data])
-    df_continuous = df_continuous.sort_values('ts_event')
+    # If multiple contracts exist, show rollover information
+    if len(unique_contracts) > 1:
+        print(f"      Found {len(unique_contracts)} contracts: {', '.join(unique_contracts)}")
+        contract_data = []
+        for contract in unique_contracts:
+            data = df_filtered[df_filtered['symbol'] == contract]
+            if len(data) > 0:
+                start = data['ts_event'].min()
+                end = data['ts_event'].max()
+                print(f"      {contract}: {start} to {end}")
+                contract_data.append(data)
+
+        # Combine all contracts chronologically
+        df_continuous = pd.concat(contract_data)
+        df_continuous = df_continuous.sort_values('ts_event')
+    else:
+        print(f"      Single contract: {unique_contracts[0]}")
+        df_continuous = df_filtered
 
     print(f"      Continuous data: {len(df_continuous):,} records")
 
@@ -147,16 +163,17 @@ def save_processed_data(df, output_path):
     return output_path
 
 
-def main(input_file=None, output_path=None):
+def main(input_file=None, output_path=None, market='ES'):
     """
     Main processing function
 
     Args:
         input_file: Path to input 1s OHLCV CSV file (optional)
         output_path: Path to output processed CSV file (optional)
+        market: Market prefix to filter (ES, NQ, YM, etc.)
     """
     print("=" * 80)
-    print("ES FUTURES 1-SECOND DATA PROCESSING")
+    print(f"{market} FUTURES 1-SECOND DATA PROCESSING")
     print("=" * 80)
 
     # Default paths (for backward compatibility)
@@ -177,10 +194,10 @@ def main(input_file=None, output_path=None):
         if df is None:
             return False
 
-        # Step 2: Filter ES contracts
-        df = filter_es_contracts(df)
+        # Step 2: Filter market contracts
+        df = filter_es_contracts(df, market=market)
         if len(df) == 0:
-            print("ERROR: No ES contracts found")
+            print(f"ERROR: No {market} contracts found")
             return False
 
         # Step 3: Create continuous contract
