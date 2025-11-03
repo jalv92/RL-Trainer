@@ -222,7 +222,7 @@ Phase 2: Position Management (Transfer Learning)
   ├─ Auto-loads newest Phase 1 model
   ├─ Inherit Phase 1 weights
   ├─ Dynamic SL/TP adjustment
-  ├─ 9 actions: Complex position management
+  ├─ 6 actions: Streamlined position management
   ├─ Focus: Risk management
   └─ Duration: 5M timesteps (~8-10 hours)
 ```
@@ -278,6 +278,14 @@ PHASE2_CONFIG = {
     'device': 'cuda'  # or 'cpu'
 }
 ```
+
+**Phase 2 Actions (6 total):**
+- Actions 0-2: Entry/Exit (Hold, Buy, Sell)
+- Action 3: Move SL to Break-Even
+- Action 4: Enable Trailing Stop
+- Action 5: Disable Trailing Stop
+
+*Note: Simplified from original 9 actions for improved learning efficiency*
 
 ## Data Format
 

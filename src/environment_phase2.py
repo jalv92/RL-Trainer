@@ -23,24 +23,21 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
     """
     Phase 2: Advanced Position Management
 
-    RL FIX #9: Expanded action space to 9 (split toggle into enable/disable)
+    RL FIX #10: Simplified action space from 9 to 6 actions
 
     Observation Space: (window_size*11 + 5,) - Market features + position state
-    Action Space: Discrete(9) - Expanded with position management actions
+    Action Space: Discrete(6) - Streamlined position management
     Reward: Risk-adjusted returns, Sharpe ratio, consistency
     """
 
-    # Expanded action space
-    # RL FIX #9: Split TOGGLE_TRAIL into explicit ENABLE/DISABLE (Markovian property)
+    # Simplified action space
+    # RL FIX #10: Reduced from 9 to 6 actions for better sample efficiency
     ACTION_HOLD = 0
     ACTION_BUY = 1
     ACTION_SELL = 2
-    ACTION_CLOSE = 3
-    ACTION_TIGHTEN_SL = 4
-    ACTION_MOVE_SL_TO_BE = 5
-    ACTION_EXTEND_TP = 6
-    ACTION_ENABLE_TRAIL = 7   # NEW: Explicit enable (was ACTION_TOGGLE_TRAIL)
-    ACTION_DISABLE_TRAIL = 8  # NEW: Explicit disable
+    ACTION_MOVE_SL_TO_BE = 3  # Was ACTION 5
+    ACTION_ENABLE_TRAIL = 4   # Was ACTION 7
+    ACTION_DISABLE_TRAIL = 5  # Was ACTION 8
 
     def __init__(
         self,
@@ -76,9 +73,9 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             trailing_drawdown_limit
         )
 
-        # Phase 2: Expanded action space (3 -> 9 actions)
-        # RL FIX #9: Increased from 8 to 9 (split toggle into enable/disable)
-        self.action_space = spaces.Discrete(9)
+        # Phase 2: Simplified action space (3 -> 6 actions)
+        # RL FIX #10: Reduced from 9 to 6 for improved sample efficiency
+        self.action_space = spaces.Discrete(6)
 
         # Phase 2 position management parameters
         self.tighten_step_atr = tighten_sl_step
@@ -93,10 +90,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         # Position management state
         self.trailing_stop_active = False
         self.highest_profit_point = 0
-        self.sl_tighten_count = 0
-        self.tp_extend_count = 0
         self.be_move_count = 0
-        self.manual_close_count = 0
 
         # Action diversity tracking (fix sell bias)
         self.buy_count = 0
@@ -111,10 +105,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         # Reset position management state
         self.trailing_stop_active = False
         self.highest_profit_point = 0
-        self.sl_tighten_count = 0
-        self.tp_extend_count = 0
         self.be_move_count = 0
-        self.manual_close_count = 0
 
         # Action diversity tracking (fix sell bias)
         self.buy_count = 0
@@ -131,18 +122,15 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         """
         Execute action with Phase 2 position management.
 
-        RL FIX #9: Updated action space (8 -> 9) for Markovian property
+        RL FIX #10: Simplified action space (9 -> 6) for better sample efficiency
 
         Actions:
             0: Hold
             1: Buy (open long)
             2: Sell (open short)
-            3: Close position (manual exit)
-            4: Tighten SL (reduce risk)
-            5: Move SL to break-even (risk-free)
-            6: Extend TP (ride trends)
-            7: Enable trailing stop (explicit enable)
-            8: Disable trailing stop (explicit disable)
+            3: Move SL to break-even (was 5)
+            4: Enable trailing stop (was 7)
+            5: Disable trailing stop (was 8)
         """
         if self.current_step >= len(self.data) - 1:
             return self._get_observation(), 0.0, False, True, {}
@@ -193,8 +181,6 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                     'exit_price': exit_price,
                     'exit_reason': exit_reason,
                     'pnl': trade_pnl,
-                    'sl_adjustments': self.sl_tighten_count,
-                    'tp_extensions': self.tp_extend_count,
                     'be_moves': self.be_move_count,
                     'trailing_used': self.trailing_stop_active,
                     'step': self.current_step
@@ -250,52 +236,6 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             position_changed = True
 
         # PHASE 2 ACTIONS (Position Management)
-        elif action == self.ACTION_CLOSE and self.position != 0:
-            # Manual close
-            if self.position == 1:
-                exit_price = current_price - self.slippage_points
-                trade_pnl = (exit_price - self.entry_price) * self.contract_size * self.position_size
-            else:
-                exit_price = current_price + self.slippage_points
-                trade_pnl = (self.entry_price - exit_price) * self.contract_size * self.position_size
-
-            trade_pnl -= (self.commission_per_side * self.position_size)
-            self.balance += trade_pnl
-            exit_reason = "manual_close"
-
-            if trade_pnl > 0:
-                self.winning_trades += 1
-            else:
-                self.losing_trades += 1
-
-            self.trade_history.append({
-                'entry_price': self.entry_price,
-                'exit_price': exit_price,
-                'exit_reason': exit_reason,
-                'pnl': trade_pnl,
-                'step': self.current_step
-            })
-
-            self._reset_position_state()
-            position_changed = True
-            pm_action_taken = "manual_close"
-            self.manual_close_count += 1
-
-        elif action == self.ACTION_TIGHTEN_SL and self.position != 0:
-            # Add validation before execution
-            is_valid, reason = self._validate_position_management_action(
-                action, current_price, atr
-            )
-            if is_valid:
-                success = self._tighten_stop_loss(current_price, atr)
-                if success:
-                    pm_action_taken = "tighten_sl"
-                    self.sl_tighten_count += 1
-            else:
-                # Penalize invalid action
-                reward -= 0.01
-                pm_action_taken = f"invalid_tighten_sl: {reason}"
-
         elif action == self.ACTION_MOVE_SL_TO_BE and self.position != 0:
             is_valid, reason = self._validate_position_management_action(
                 action, current_price, atr
@@ -309,20 +249,6 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                 reward -= 0.01
                 pm_action_taken = f"invalid_move_to_be: {reason}"
 
-        elif action == self.ACTION_EXTEND_TP and self.position != 0:
-            is_valid, reason = self._validate_position_management_action(
-                action, current_price, atr
-            )
-            if is_valid:
-                success = self._extend_take_profit(current_price, atr)
-                if success:
-                    pm_action_taken = "extend_tp"
-                    self.tp_extend_count += 1
-            else:
-                reward -= 0.01
-                pm_action_taken = f"invalid_extend_tp: {reason}"
-
-        # RL FIX #9: Separate enable and disable trailing stop actions
         elif action == self.ACTION_ENABLE_TRAIL and self.position != 0:
             is_valid, reason = self._validate_position_management_action(
                 action, current_price, atr
@@ -423,48 +349,12 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             'portfolio_value': portfolio_value,
             'position': self.position,
             'pm_action': pm_action_taken,
-            'sl_tightens': self.sl_tighten_count,
-            'tp_extends': self.tp_extend_count,
             'be_moves': self.be_move_count,
-            'manual_closes': self.manual_close_count,
             'num_trades': self.num_trades,
             'balance': self.balance
         }
 
         return obs, reward, terminated, truncated, info
-
-    def _tighten_stop_loss(self, current_price: float, atr: float) -> bool:
-        """
-        Tighten stop loss by tighten_step_atr.
-        Only allowed if currently profitable.
-
-        Returns:
-            True if SL was successfully tightened
-        """
-        if self.position == 0 or atr <= 0:
-            return False
-
-        unrealized = (current_price - self.entry_price) if self.position == 1 else (self.entry_price - current_price)
-
-        # Only tighten if profitable
-        if unrealized <= 0:
-            return False
-
-        tighten_amount = atr * self.tighten_step_atr
-
-        if self.position == 1:
-            new_sl = self.sl_price + tighten_amount
-            # Don't tighten past current price (leave buffer)
-            if new_sl < current_price - (atr * 0.2):
-                self.sl_price = new_sl
-                return True
-        else:
-            new_sl = self.sl_price - tighten_amount
-            if new_sl > current_price + (atr * 0.2):
-                self.sl_price = new_sl
-                return True
-
-        return False
 
     def _move_sl_to_breakeven(self, current_price: float) -> bool:
         """
@@ -496,33 +386,6 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             self.sl_price = self.entry_price + buffer
         else:
             self.sl_price = self.entry_price - buffer
-
-        return True
-
-    def _extend_take_profit(self, current_price: float, atr: float) -> bool:
-        """
-        Extend take profit target by extend_step_atr.
-        Only allowed if significantly profitable (> 1R).
-
-        Returns:
-            True if TP was extended
-        """
-        if self.position == 0 or atr <= 0:
-            return False
-
-        unrealized = (current_price - self.entry_price) if self.position == 1 else (self.entry_price - current_price)
-
-        # Only extend if significantly profitable (> 1R)
-        initial_risk = abs(self.entry_price - self.sl_price)
-        if unrealized < initial_risk:
-            return False
-
-        extend_amount = atr * self.extend_step_atr
-
-        if self.position == 1:
-            self.tp_price += extend_amount
-        else:
-            self.tp_price -= extend_amount
 
         return True
 
@@ -598,32 +461,13 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
     def _validate_position_management_action(self, action, current_price, atr):
         """
         Validate position management actions before execution.
-        
+
         CRITICAL: Prevent invalid actions that could violate trading rules
         """
         if atr <= 0 or np.isnan(atr):
             return False, "Invalid ATR"
-        
-        if action == self.ACTION_TIGHTEN_SL:
-            # Check if SL can be tightened further
-            if self.position == 1:  # Long
-                new_sl = self.sl_price + (atr * self.tighten_step_atr)
-                # Don't tighten too close to current price
-                min_sl_distance = current_price - (atr * 0.5)  # Minimum 0.5 ATR away
-                if new_sl >= min_sl_distance:
-                    return False, "SL too close to market"
-                # Don't tighten beyond current price
-                if new_sl >= current_price:
-                    return False, "SL beyond market price"
-            else:  # Short
-                new_sl = self.sl_price - (atr * self.tighten_step_atr)
-                min_sl_distance = current_price + (atr * 0.5)
-                if new_sl <= min_sl_distance:
-                    return False, "SL too close to market"
-                if new_sl <= current_price:
-                    return False, "SL beyond market price"
-        
-        elif action == self.ACTION_MOVE_SL_TO_BE:
+
+        if action == self.ACTION_MOVE_SL_TO_BE:
             # Only allow if currently profitable
             unrealized = self._calculate_unrealized_pnl(current_price)
             if unrealized <= 0:
@@ -634,15 +478,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                 return False, "SL already at or past BE"
             if self.position == -1 and self.sl_price <= self.entry_price:
                 return False, "SL already at or past BE"
-        
-        elif action == self.ACTION_EXTEND_TP:
-            # Only allow if significantly profitable (> 1R)
-            unrealized = self._calculate_unrealized_pnl(current_price)
-            initial_risk = abs(self.entry_price - self.sl_price) * self.contract_size
-            if unrealized < initial_risk:
-                return False, "Not profitable enough to extend"
-        
-        # RL FIX #9: Validate enable and disable separately
+
         elif action == self.ACTION_ENABLE_TRAIL:
             # Only allow enabling trailing if profitable
             unrealized = self._calculate_unrealized_pnl(current_price)
@@ -670,15 +506,15 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         Get action mask for current state.
 
         RL FIX #4: Action masking prevents wasted exploration on invalid actions.
-        This dramatically improves sample efficiency in Phase 2.
+        RL FIX #10: Updated for simplified 6-action space.
 
         Returns:
-            np.ndarray: Boolean mask of shape (9,) where True = valid action
+            np.ndarray: Boolean mask of shape (6,) where True = valid action
 
         Called by MaskablePPO before each action selection.
         """
         # Start with all actions valid
-        mask = np.ones(9, dtype=bool)
+        mask = np.ones(6, dtype=bool)
 
         current_price = self.data['close'].iloc[self.current_step]
         current_atr = self.data['atr'].iloc[self.current_step]
@@ -704,46 +540,30 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             mask[1] = in_rth  # Buy only in RTH
             mask[2] = in_rth  # Sell only in RTH
             # Disable all position management actions
-            mask[3:9] = False  # Close, Tighten SL, Move BE, Extend TP, Enable Trail, Disable Trail
+            mask[3:6] = False  # Move BE, Enable Trail, Disable Trail
 
         else:
             # Agent HAS POSITION - validate each position management action
             mask[0] = True  # Hold always valid
             mask[1] = False  # Can't open new long when in position
             mask[2] = False  # Can't open new short when in position
-            mask[3] = True  # Close always valid when in position
 
-            # Tighten SL: only if profitable and SL can move up
             unrealized_pnl = self._calculate_unrealized_pnl(current_price)
-            if unrealized_pnl > 0:
-                tighten_amount = current_atr * self.tighten_step_atr
-                if self.position == 1:  # Long
-                    new_sl = self.sl_price + tighten_amount
-                    mask[4] = new_sl < current_price - (current_atr * 0.2)
-                else:  # Short
-                    new_sl = self.sl_price - tighten_amount
-                    mask[4] = new_sl > current_price + (current_atr * 0.2)
-            else:
-                mask[4] = False  # Can't tighten when losing
 
             # Move to BE: only if profitable and not already at BE
             if unrealized_pnl > 0:
                 if self.position == 1:
-                    mask[5] = self.sl_price < self.entry_price
+                    mask[3] = self.sl_price < self.entry_price
                 else:
-                    mask[5] = self.sl_price > self.entry_price
+                    mask[3] = self.sl_price > self.entry_price
             else:
-                mask[5] = False
-
-            # Extend TP: only if significantly profitable (> 1R)
-            initial_risk = abs(self.entry_price - self.sl_price) * self.contract_size * self.position_size
-            mask[6] = unrealized_pnl > initial_risk
+                mask[3] = False
 
             # Enable trailing: only if profitable and not already enabled
-            mask[7] = (unrealized_pnl > 0) and (not self.trailing_stop_active)
+            mask[4] = (unrealized_pnl > 0) and (not self.trailing_stop_active)
 
             # Disable trailing: only if currently enabled
-            mask[8] = self.trailing_stop_active
+            mask[5] = self.trailing_stop_active
 
         return mask
 

@@ -1,9 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Read(//mnt/c/Users/javlo/Downloads/ScreenShot/**)",
-      "Read(//mnt/c/Users/javlo/Documents/**)",
-      "Bash(python3:*)"
+      "Bash(git reset:*)",
+      "Bash(git config:*)"
     ],
     "deny": [],
     "ask": []

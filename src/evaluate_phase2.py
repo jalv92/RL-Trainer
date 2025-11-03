@@ -288,12 +288,9 @@ def evaluate_phase2_model(
         0: 'Hold',
         1: 'Buy',
         2: 'Sell',
-        3: 'Close',
-        4: 'Tighten SL',
-        5: 'Move to BE',
-        6: 'Extend TP',
-        7: 'Enable Trail',  # Phase 2 has explicit enable/disable (9 actions total)
-        8: 'Disable Trail'
+        3: 'Move to BE',      # Was 5
+        4: 'Enable Trail',    # Was 7
+        5: 'Disable Trail'    # Was 8
     }
 
     # PM action usage

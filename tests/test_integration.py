@@ -155,7 +155,7 @@ class TestTrainingPipeline(unittest.TestCase):
         max_steps = len(self.test_data) - 20 - 1
 
         while not terminated and not truncated and step_count < max_steps:
-            action = np.random.choice(range(8))  # Random actions (0-7)
+            action = np.random.choice(range(6))  # Random actions (0-5)
             obs, reward, terminated, truncated, info = env.step(action)
             step_count += 1
 
@@ -336,14 +336,11 @@ class TestPositionManagement(unittest.TestCase):
         )
         self.assertTrue(is_valid)
 
-        # Test invalid move to BE (when losing)
-        env.position = 1
-        env.entry_price = 4020  # Current price is 4010, so losing
+        # Test valid enable trailing
         is_valid, reason = env._validate_position_management_action(
-            env.ACTION_MOVE_SL_TO_BE, current_price, atr
+            env.ACTION_ENABLE_TRAIL, current_price, atr
         )
-        self.assertFalse(is_valid)
-        self.assertIn("losing", reason.lower())
+        self.assertTrue(is_valid)
 
 
 class TestMetricsCalculation(unittest.TestCase):

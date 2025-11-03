@@ -3,7 +3,7 @@
 """
 Phase 2: Position Management Training with Transfer Learning
 - Load Phase 1 weights
-- Expand action space from 3 -> 9
+- Expand action space from 3 -> 6
 - Train dynamic SL/TP management
 - Duration: 15M timesteps (~12-16 hours on RTX 4000 Ada 20GB)
 
@@ -655,7 +655,7 @@ def load_phase1_and_transfer(config, env):
             safe_print("[TRANSFER] Random shortcuts created for faster Phase 2 adaptation")
         else:
             safe_print("[TRANSFER] Phase 1 knowledge (entry patterns) preserved")
-        safe_print("[TRANSFER] New actions (3-8) initialized for learning")
+        safe_print("[TRANSFER] New actions (3-5) initialized for learning")
 
         return phase2_model
 
@@ -680,7 +680,7 @@ def train_phase2():
         safe_print(f"[CONFIG] Parallel envs (effective): {num_envs}")
     safe_print(f"[SYSTEM] BLAS threads per process: {os.environ.get('OPENBLAS_NUM_THREADS', 'unknown')}")
     safe_print(f"[CONFIG] Network: {PHASE2_CONFIG['policy_layers']}")
-    safe_print(f"[CONFIG] Action space: 9 (RL Fix #9: split toggle -> enable/disable)")
+    safe_print(f"[CONFIG] Action space: 6 (RL Fix #10: simplified from 9 to 6)")
     safe_print(f"[CONFIG] Device: {PHASE2_CONFIG['device']}")
     safe_print(f"[CONFIG] Position size: {PHASE2_CONFIG['position_size']} contracts (full)")
     safe_print(f"[CONFIG] Trailing DD: ${PHASE2_CONFIG['trailing_dd_limit']:,} (strict Apex)")
@@ -810,13 +810,10 @@ def train_phase2():
     safe_print("\n" + "=" * 80)
     safe_print(f"[TRAIN] Starting Phase 2 training for {PHASE2_CONFIG['total_timesteps']:,} timesteps...")
     safe_print("=" * 80)
-    safe_print("\n[TRAIN] Position management actions (RL Fix #9 - Markovian):")
-    safe_print("        Action 3: Close position (manual exit)")
-    safe_print("        Action 4: Tighten SL (reduce risk)")
-    safe_print("        Action 5: Move SL to break-even (risk-free)")
-    safe_print("        Action 6: Extend TP (ride trends)")
-    safe_print("        Action 7: Enable trailing stop (explicit enable)")
-    safe_print("        Action 8: Disable trailing stop (explicit disable)")
+    safe_print("\n[TRAIN] Position management actions (RL Fix #10 - Simplified):")
+    safe_print("        Action 3: Move SL to break-even (risk-free)")
+    safe_print("        Action 4: Enable trailing stop (explicit enable)")
+    safe_print("        Action 5: Disable trailing stop (explicit disable)")
     safe_print("\n[TRAIN] Monitor progress:")
     safe_print("        - TensorBoard: tensorboard --logdir tensorboard_logs/phase2/")
     safe_print("        - Logs: logs/phase2/evaluations.npz")

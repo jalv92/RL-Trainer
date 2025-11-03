@@ -249,10 +249,7 @@ class TestTradingEnvironmentPhase2(unittest.TestCase):
         # Check Phase 2 specific attributes
         self.assertFalse(self.env.trailing_stop_active)
         self.assertEqual(self.env.highest_profit_point, 0)
-        self.assertEqual(self.env.sl_tighten_count, 0)
-        self.assertEqual(self.env.tp_extend_count, 0)
         self.assertEqual(self.env.be_move_count, 0)
-        self.assertEqual(self.env.manual_close_count, 0)
     
     def test_position_management_validation(self):
         """Test position management action validation."""
@@ -267,34 +264,32 @@ class TestTradingEnvironmentPhase2(unittest.TestCase):
         
         current_price = 4010
         atr = 20
-        
-        # Test valid tighten SL
+
+        # Test valid Move to BE
         is_valid, reason = env._validate_position_management_action(
-            env.ACTION_TIGHTEN_SL, current_price, atr
+            env.ACTION_MOVE_SL_TO_BE, current_price, atr
         )
         self.assertTrue(is_valid)
-        
-        # Test invalid tighten SL (too close to market)
-        env.sl_price = 4009  # Very close to current price
+
+        # Test invalid Move to BE (when losing)
+        env.entry_price = 4020  # Current price 4010, so losing
         is_valid, reason = env._validate_position_management_action(
-            env.ACTION_TIGHTEN_SL, current_price, atr
+            env.ACTION_MOVE_SL_TO_BE, current_price, atr
         )
         self.assertFalse(is_valid)
-        self.assertIn("too close", reason.lower())
+        self.assertIn("losing", reason.lower())
     
     def test_expanded_action_space(self):
-        """Test Phase 2 has expanded action space."""
-        self.assertEqual(self.env.action_space.n, 8)  # Should have 8 actions
-        
+        """Test Phase 2 has simplified action space."""
+        self.assertEqual(self.env.action_space.n, 6)  # Should have 6 actions
+
         # Test all action constants
         self.assertEqual(self.env.ACTION_HOLD, 0)
         self.assertEqual(self.env.ACTION_BUY, 1)
         self.assertEqual(self.env.ACTION_SELL, 2)
-        self.assertEqual(self.env.ACTION_CLOSE, 3)
-        self.assertEqual(self.env.ACTION_TIGHTEN_SL, 4)
-        self.assertEqual(self.env.ACTION_MOVE_SL_TO_BE, 5)
-        self.assertEqual(self.env.ACTION_EXTEND_TP, 6)
-        self.assertEqual(self.env.ACTION_TOGGLE_TRAIL, 7)
+        self.assertEqual(self.env.ACTION_MOVE_SL_TO_BE, 3)
+        self.assertEqual(self.env.ACTION_ENABLE_TRAIL, 4)
+        self.assertEqual(self.env.ACTION_DISABLE_TRAIL, 5)
     
     def test_unrealized_pnl_calculation(self):
         """Test unrealized P&L calculation."""
@@ -328,14 +323,14 @@ class TestTradingEnvironmentPhase2(unittest.TestCase):
         
         # Test with zero ATR
         is_valid, reason = env._validate_position_management_action(
-            env.ACTION_TIGHTEN_SL, 4010, 0
+            env.ACTION_MOVE_SL_TO_BE, 4010, 0
         )
         self.assertFalse(is_valid)
         self.assertEqual(reason, "Invalid ATR")
-        
+
         # Test with NaN ATR
         is_valid, reason = env._validate_position_management_action(
-            env.ACTION_TIGHTEN_SL, 4010, float('nan')
+            env.ACTION_MOVE_SL_TO_BE, 4010, float('nan')
         )
         self.assertFalse(is_valid)
         self.assertEqual(reason, "Invalid ATR")

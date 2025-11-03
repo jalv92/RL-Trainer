@@ -74,6 +74,31 @@ All notable changes to this project are documented in this file. Entries are gro
   - New features are opt-in through menu or command-line flags
   - Default behavior unchanged for standard training
 
+## [Unreleased] - 2025-11-02
+
+### Changed - BREAKING CHANGE
+- **Reduced Phase 2 action space from 9 to 6 actions** for improved sample efficiency and reduced overfitting
+- Removed actions: Close position (3), Tighten SL (4), Extend TP (6)
+- Renumbered remaining actions: Move to BE (3, was 5), Enable Trail (4, was 7), Disable Trail (5, was 8)
+- Updated `src/environment_phase2.py`: action constants, space size, validation, masking logic
+- Updated `src/train_phase2.py`: documentation and training output messages
+- Updated `src/evaluate_phase2.py`: action name mapping for evaluation reports
+- Fixed `tests/test_environment.py`: corrected action space size from 8 to 6, updated action constant tests
+- Fixed `tests/test_integration.py`: corrected hardcoded action ranges from 8 to 6
+- Updated `README.md`: documented new 6-action space with rationale
+- Updated `docs/FIXES_SUMMARY.md`: added RL FIX #10 entry
+
+### Benefits
+- Improved sample efficiency with smaller action space
+- Reduced overfitting risk through simpler decision space
+- Faster training convergence
+- Retained all critical risk management capabilities
+
+### Migration Notes
+- **Any existing Phase 2 models trained with 9 actions are incompatible**
+- Phase 2 models must be retrained from Phase 1 checkpoints
+- Phase 1 models are unaffected and can still be used for transfer learning
+
 ## [Unreleased]
 ### Added
 - Upgraded UI framework from standard Tkinter to CustomTkinter for modern appearance with rounded corners, dark theme, and enhanced visual elements.
