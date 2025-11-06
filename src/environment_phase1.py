@@ -16,6 +16,7 @@ from typing import Tuple, Dict, Optional
 import gymnasium as gym
 from gymnasium import spaces
 from datetime import datetime
+from src.market_specs import MarketSpecification, ES_SPEC
 
 
 class TradingEnvironmentPhase1(gym.Env):
@@ -40,9 +41,12 @@ class TradingEnvironmentPhase1(gym.Env):
         initial_balance: float = 50000,
         window_size: int = 20,
         second_data: pd.DataFrame = None,
+        # Market specifications
+        market_spec: MarketSpecification = None,
+        commission_override: float = None,
         # Phase 1 specific parameters (FIXED SL/TP)
-        fixed_sl_atr_multiplier: float = 1.5,
-        fixed_tp_to_sl_ratio: float = 2.0,
+        initial_sl_multiplier: float = 1.5,
+        initial_tp_ratio: float = 3.0,
         position_size_contracts: float = 0.5,
         trailing_drawdown_limit: float = 5000  # Relaxed for Phase 1
     ):
@@ -54,8 +58,10 @@ class TradingEnvironmentPhase1(gym.Env):
             initial_balance: Starting capital ($50,000 for Apex)
             window_size: Lookback window for observations (20 bars)
             second_data: Optional second-level data for precise drawdown
-            fixed_sl_atr_multiplier: SL distance in ATR (1.5 = 1.5× ATR) - FIXED
-            fixed_tp_to_sl_ratio: TP as multiple of SL (3.0 = 3:1 R:R) - FIXED
+            market_spec: Market specification object (defaults to ES if None)
+            commission_override: Override default commission (None = use market default)
+            initial_sl_multiplier: SL distance in ATR (1.5 = 1.5× ATR) - FIXED
+            initial_tp_ratio: TP as multiple of SL (3.0 = 3:1 R:R) - FIXED
             position_size_contracts: Contract quantity (0.5 for safety)
             trailing_drawdown_limit: Max drawdown allowed ($5,000 relaxed)
         """
@@ -67,8 +73,8 @@ class TradingEnvironmentPhase1(gym.Env):
         self.second_data = second_data
 
         # PHASE 1 CONSTRAINT: Fixed SL/TP (not adaptive)
-        self.sl_atr_mult = fixed_sl_atr_multiplier
-        self.tp_sl_ratio = fixed_tp_to_sl_ratio
+        self.sl_atr_mult = initial_sl_multiplier
+        self.tp_sl_ratio = initial_tp_ratio
         self.position_size = position_size_contracts
         self.trailing_dd_limit = trailing_drawdown_limit
 
@@ -78,10 +84,21 @@ class TradingEnvironmentPhase1(gym.Env):
         self.profit_target_reached_step = None
         self.trailing_stopped = False  # Stops when profit target reached
 
-        # ES Futures specifications
-        self.contract_size = 50  # $50 per point
-        self.commission_per_side = 2.50
-        self.slippage_points = 0.25
+        # Market specifications (DYNAMIC - supports all futures markets)
+        if market_spec is None:
+            market_spec = ES_SPEC  # Default to ES for backward compatibility
+
+        self.market_symbol = market_spec.symbol
+        self.market_name = market_spec.name
+        self.contract_size = market_spec.contract_multiplier
+        self.tick_size = market_spec.tick_size
+        self.tick_value = market_spec.tick_value
+
+        # Commission (user can override, otherwise use market default)
+        self.commission_per_side = commission_override if commission_override is not None else market_spec.commission
+
+        # Slippage (market-dependent: liquid markets = 1 tick, less liquid = 2 ticks)
+        self.slippage_points = market_spec.tick_size * market_spec.slippage_ticks
 
         # Gymnasium spaces
         self.action_space = spaces.Discrete(3)

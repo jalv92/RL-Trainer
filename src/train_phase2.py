@@ -50,10 +50,12 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
-from environment_phase2 import TradingEnvironmentPhase2
-from kl_callback import KLDivergenceCallback
-from feature_engineering import add_market_regime_features
-from model_utils import detect_models_in_folder, detect_available_markets, select_market_for_training
+from src.environment_phase2 import TradingEnvironmentPhase2
+from src.kl_callback import KLDivergenceCallback
+from src.feature_engineering import add_market_regime_features
+from src.model_utils import detect_models_in_folder, detect_available_markets, select_market_for_training
+from src.market_specs import get_market_spec
+from src.metadata_utils import read_metadata, write_metadata
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -161,6 +163,9 @@ PHASE2_CONFIG = {
     'trailing_dd_limit': 2500,  # Strict Apex rules ($5k in Phase 1)
     'tighten_sl_step': 0.5,
     'extend_tp_step': 1.0,
+
+    # Market specifications (optional override)
+    'commission_override': None,  # None = use market default, or set custom value (e.g., 1.50)
 
     # Evaluation - More frequent for better early stopping
     'eval_freq': 50_000,  # Every 50K = 100 evals max (5M / 50K)
@@ -391,7 +396,7 @@ def load_data(train_split=0.7, market=None):
     return train_data, val_data, train_second_data, val_second_data
 
 
-def make_env(data, second_data, env_id, config):
+def make_env(data, second_data, env_id, config, market_spec):
     """
     Create Phase 2 environment factory with random episode starts to prevent temporal leakage.
 
@@ -441,6 +446,8 @@ def make_env(data, second_data, env_id, config):
             window_size=config['window_size'],
             initial_balance=config['initial_balance'],
             second_data=env_second_data,  # Pass second-level data
+            market_spec=market_spec,  # NEW: Pass market spec
+            commission_override=config.get('commission_override', None),  # NEW: Optional override
             initial_sl_multiplier=config['initial_sl_multiplier'],
             initial_tp_ratio=config['initial_tp_ratio'],
             position_size_contracts=config['position_size'],
@@ -548,10 +555,40 @@ def load_phase1_and_transfer(config, env):
 
     safe_print(f"\n[TRANSFER] Loading Phase 1 model from {phase1_path}")
 
+    target_market = config.get('target_market')
+
     try:
         # Load Phase 1 model (3 actions)
         phase1_model = PPO.load(phase1_path, device=config['device'])
         safe_print("[TRANSFER] [OK] Phase 1 model loaded")
+
+        phase1_meta = read_metadata(phase1_path)
+        if phase1_meta:
+            meta_market = phase1_meta.get('market')
+            if target_market and meta_market and meta_market.upper() != target_market.upper():
+                raise RuntimeError(
+                    f"Phase 1 model market mismatch: expected {target_market}, found {meta_market}"
+                )
+            if phase1_meta.get('test_mode'):
+                raise RuntimeError(
+                    "Phase 1 model metadata indicates test mode; retrain Phase 1 with full timesteps."
+                )
+        else:
+            safe_print("[TRANSFER] [WARN] Phase 1 model metadata not found; cannot verify market alignment")
+
+        vecnorm_meta = read_metadata(config['phase1_vecnorm_path']) if os.path.exists(config['phase1_vecnorm_path']) else None
+        if vecnorm_meta:
+            meta_market = vecnorm_meta.get('market')
+            if target_market and meta_market and meta_market.upper() != target_market.upper():
+                raise RuntimeError(
+                    f"Phase 1 VecNormalize market mismatch: expected {target_market}, found {meta_market}"
+                )
+            if vecnorm_meta.get('test_mode'):
+                raise RuntimeError(
+                    "Phase 1 VecNormalize metadata indicates test mode; retrain Phase 1 with full timesteps."
+                )
+        elif os.path.exists(config['phase1_vecnorm_path']):
+            safe_print("[TRANSFER] [WARN] Phase 1 VecNormalize metadata not found; cannot verify market alignment")
 
         # Create new Phase 2 model (9 actions with action masking)
         safe_print("[TRANSFER] Creating Phase 2 model with expanded action space (9 actions + masking)...")
@@ -688,8 +725,13 @@ def load_phase1_and_transfer(config, env):
         return None
 
 
-def train_phase2():
-    """Execute Phase 2 training with transfer learning."""
+def train_phase2(market_override=None, non_interactive=False, test_mode=False):
+    """Execute Phase 2 training with transfer learning.
+
+    Args:
+        market_override: Optional market symbol to use (ES, NQ, etc.). If None, will prompt interactively.
+        non_interactive: If True, run in non-interactive mode (no prompts, use defaults)
+    """
     safe_print("=" * 80)
     safe_print("PHASE 2: POSITION MANAGEMENT MASTERY")
     safe_print("=" * 80)
@@ -698,14 +740,33 @@ def train_phase2():
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(script_dir, 'data')
     available_markets = detect_available_markets(data_dir)
-    selected_market = select_market_for_training(available_markets, safe_print)
 
-    if selected_market is None:
-        safe_print("\n[ERROR] No market selected. Exiting training.")
-        return  # User cancelled or no data
+    # If market override provided via CLI, use it directly
+    if market_override:
+        from src.market_specs import get_market_spec
+        market_spec = get_market_spec(market_override.upper())
+        if market_spec is None:
+            safe_print(f"\n[ERROR] Invalid market symbol: {market_override}")
+            safe_print("[ERROR] Valid markets: ES, NQ, YM, RTY, MNQ, MES, M2K, MYM")
+            return
+        # Find the matching market data
+        selected_market = next((m for m in available_markets if m['market'] == market_override.upper()), None)
+        if selected_market is None:
+            safe_print(f"\n[ERROR] No data found for market: {market_override}")
+            safe_print(f"[ERROR] Available markets: {', '.join([m['market'] for m in available_markets])}")
+            return
+        market_name = market_override.upper()
+        safe_print(f"\n[CLI] Market specified via --market: {market_name}")
+    else:
+        # Interactive market selection
+        selected_market, market_spec = select_market_for_training(available_markets, safe_print)
+        if selected_market is None or market_spec is None:
+            safe_print("\n[INFO] Training cancelled - no market selected")
+            return  # User cancelled or no data
+        market_name = selected_market['market']
 
-    market_name = selected_market['market']
     safe_print(f"\n[TRAINING] Market: {market_name}")
+    PHASE2_CONFIG['target_market'] = market_name
 
     safe_print(f"[CONFIG] Total timesteps: {PHASE2_CONFIG['total_timesteps']:,}")
     requested_envs = PHASE2_CONFIG['num_envs']
@@ -734,7 +795,7 @@ def train_phase2():
 
     # Create vectorized TRAINING environments (use TRAIN data only)
     safe_print(f"\n[ENV] Creating {num_envs} Phase 2 TRAINING environments...")
-    env_fns = [make_env(train_data, train_second_data, i, PHASE2_CONFIG) for i in range(num_envs)]
+    env_fns = [make_env(train_data, train_second_data, i, PHASE2_CONFIG, market_spec) for i in range(num_envs)]
 
     if num_envs > 1:
         env = SubprocVecEnv(env_fns)
@@ -751,6 +812,8 @@ def train_phase2():
         window_size=PHASE2_CONFIG['window_size'],
         initial_balance=PHASE2_CONFIG['initial_balance'],
         second_data=val_second_data,  # CHANGED: Use val second-level data
+        market_spec=market_spec,  # NEW: Pass market spec
+        commission_override=PHASE2_CONFIG.get('commission_override', None),  # NEW
         initial_sl_multiplier=PHASE2_CONFIG['initial_sl_multiplier'],
         initial_tp_ratio=PHASE2_CONFIG['initial_tp_ratio'],
         position_size_contracts=PHASE2_CONFIG['position_size'],
@@ -884,15 +947,34 @@ def train_phase2():
 
     # Save final model
     safe_print("\n[SAVE] Saving final Phase 2 model...")
-    model.save('models/phase2_position_mgmt_final')
-    env.save('models/phase2_vecnorm.pkl')
+    final_model_base = 'models/phase2_position_mgmt_final'
+    final_vecnorm_path = 'models/phase2_position_mgmt_final_vecnorm.pkl'
+
+    if test_mode:
+        final_model_base = 'models/phase2_position_mgmt_test'
+        final_vecnorm_path = 'models/phase2_position_mgmt_test_vecnorm.pkl'
+        safe_print("[SAVE] Test mode run detected - using test-specific artifact names")
+
+    model.save(final_model_base)
+    env.save(final_vecnorm_path)
+
+    metadata_common = {
+        'phase': 2,
+        'market': market_name,
+        'total_timesteps': int(model.num_timesteps),
+        'timesteps_target': int(PHASE2_CONFIG['total_timesteps']),
+        'test_mode': bool(test_mode),
+    }
+
+    write_metadata(final_model_base, {**metadata_common, 'artifact': 'model'})
+    write_metadata(final_vecnorm_path, {**metadata_common, 'artifact': 'vecnormalize'})
 
     safe_print("\n" + "=" * 80)
     safe_print("PHASE 2 TRAINING COMPLETE!")
     safe_print("=" * 80)
     safe_print(f"[RESULTS] Training time: {elapsed/3600:.2f} hours")
-    safe_print(f"[SAVE] Model: models/phase2_position_mgmt_final.zip")
-    safe_print(f"[SAVE] VecNorm: models/phase2_vecnorm.pkl")
+    safe_print(f"[SAVE] Model: {final_model_base}.zip")
+    safe_print(f"[SAVE] VecNorm: {final_vecnorm_path}")
     safe_print(f"[SAVE] Best model: models/phase2/best_model.zip")
     safe_print()
     safe_print("[SUCCESS] Two-phase training complete!")
@@ -911,6 +993,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Phase 2 Training')
     parser.add_argument('--test', action='store_true',
                        help='Run in test mode with reduced timesteps (50K for quick local testing)')
+    parser.add_argument('--market', type=str, default=None,
+                       help='Market to train on (ES, NQ, YM, RTY, MNQ, MES, M2K, MYM). If not specified, will prompt interactively.')
+    parser.add_argument('--non-interactive', action='store_true',
+                       help='Run in non-interactive mode (no prompts, use defaults)')
     args = parser.parse_args()
 
     # Override config for test mode (quick local testing)
@@ -938,4 +1024,8 @@ if __name__ == '__main__':
     np.random.seed(42)
     torch.manual_seed(42)
 
-    train_phase2()
+    train_phase2(
+        market_override=args.market,
+        non_interactive=args.non_interactive,
+        test_mode=args.test,
+    )

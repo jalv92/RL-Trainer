@@ -199,7 +199,83 @@ class RLTrainerMenu:
         ]
 
         print("\n".join(banner_sections))
-    
+
+    def detect_and_select_market(self) -> Optional[str]:
+        """
+        Detect available market data files and prompt user to select one.
+
+        Returns:
+            Selected market symbol (e.g., 'ES', 'NQ') or None if cancelled
+        """
+        try:
+            # Import market detection utilities from model_utils
+            sys.path.insert(0, str(self.src_dir))
+            from model_utils import detect_available_markets
+            from market_specs import get_market_spec
+
+            # Detect available markets
+            data_dir = self.project_dir / 'data'
+            available_markets = detect_available_markets(str(data_dir))
+
+            if not available_markets:
+                print(f"\n{Colors.RED}No market data files found in data/ directory.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Please run 'Data Processing' first to prepare market data.{Colors.RESET}")
+                return None
+
+            # Display header
+            print(f"\n{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
+            print(f"{Colors.BOLD}{Colors.CYAN}║                   MARKET SELECTION                            ║{Colors.RESET}")
+            print(f"{Colors.BOLD}{Colors.CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
+            print()
+
+            # If only one market, auto-select it
+            if len(available_markets) == 1:
+                market = available_markets[0]['market']
+                market_spec = get_market_spec(market)
+                spec_info = f"${market_spec.contract_multiplier} x {market_spec.tick_size} tick = ${market_spec.tick_value:.2f}"
+
+                print(f"{Colors.GREEN}Detected 1 market:{Colors.RESET}")
+                print(f"  • {Colors.BOLD}{market}{Colors.RESET} - {available_markets[0]['minute_file']}")
+                print(f"    {Colors.CYAN}{spec_info}{Colors.RESET}")
+                print(f"\n{Colors.GREEN}Auto-selecting {market} for training.{Colors.RESET}")
+                return market
+
+            # Multiple markets - show selection menu
+            print(f"{Colors.GREEN}Detected {len(available_markets)} markets:{Colors.RESET}\n")
+
+            for i, market_info in enumerate(available_markets, 1):
+                market = market_info['market']
+                market_spec = get_market_spec(market)
+                spec_info = f"${market_spec.contract_multiplier} x {market_spec.tick_size} tick = ${market_spec.tick_value:.2f}"
+
+                print(f"{Colors.BOLD}  {i}. {market:<8}{Colors.RESET} - {market_info['minute_file']:<25}")
+                print(f"     {Colors.CYAN}{spec_info} | Commission: ${market_spec.commission}/side{Colors.RESET}")
+                print()
+
+            print(f"{Colors.YELLOW}  0. Cancel{Colors.RESET}")
+            print()
+
+            # Get user selection
+            valid_choices = [str(i) for i in range(len(available_markets) + 1)]
+            choice = self.get_user_input(
+                f"{Colors.BOLD}Select market to train on (0-{len(available_markets)}): {Colors.RESET}",
+                valid_choices
+            )
+
+            if choice == "0" or choice is None:
+                print(f"\n{Colors.YELLOW}Market selection cancelled.{Colors.RESET}")
+                return None
+
+            # Return selected market symbol
+            selected_market = available_markets[int(choice) - 1]['market']
+            print(f"\n{Colors.GREEN}Selected market: {Colors.BOLD}{selected_market}{Colors.RESET}")
+            return selected_market
+
+        except Exception as e:
+            self.logger.error(f"Error detecting markets: {str(e)}", exc_info=True)
+            print(f"\n{Colors.RED}Error detecting markets: {str(e)}{Colors.RESET}")
+            return None
+
     def display_main_menu(self):
         """Display the main menu options."""
         print(f"\n{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
@@ -298,9 +374,9 @@ class RLTrainerMenu:
             # Always run from project root directory
             working_directory = self.project_dir
 
-            # Set up environment with src/ in PYTHONPATH for imports
+            # Set up environment with project root in PYTHONPATH for imports
             env = os.environ.copy()
-            pythonpath = str(self.src_dir)
+            pythonpath = str(self.project_dir)
             if 'PYTHONPATH' in env:
                 env['PYTHONPATH'] = f"{pythonpath}{os.pathsep}{env['PYTHONPATH']}"
             else:
@@ -311,7 +387,9 @@ class RLTrainerMenu:
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                universal_newlines=True,
+                stdin=subprocess.DEVNULL,  # Prevent interactive prompts from hanging
+                encoding='utf-8',  # Explicitly use UTF-8 to handle Unicode characters (✅, ⚠️, etc.)
+                errors='replace',  # Replace invalid characters instead of crashing
                 cwd=working_directory,
                 env=env
             )
@@ -350,7 +428,7 @@ class RLTrainerMenu:
             # Save to log file if specified
             if log_file:
                 log_path = self.logs_dir / log_file
-                with open(log_path, 'a') as f:
+                with open(log_path, 'a', encoding='utf-8') as f:
                     f.write(f"\n{'=' * 60}\n")
                     f.write(f"{datetime.now().isoformat()} - {description}\n")
                     f.write(f"Command: {' '.join(command)}\n")
@@ -629,7 +707,7 @@ class RLTrainerMenu:
         """Run training in test mode."""
         print(f"\n{Colors.BOLD}{Colors.YELLOW}TRAINING TEST MODE{Colors.RESET}")
         print(f"{Colors.CYAN}This will run a quick test with reduced dataset for local testing.{Colors.RESET}")
-        
+
         # Confirm
         confirm = self.get_user_input(
             f"{Colors.YELLOW}Proceed with test training? (y/n): {Colors.RESET}",
@@ -639,12 +717,18 @@ class RLTrainerMenu:
         if confirm is None or confirm.lower() != 'y':
             print(f"{Colors.YELLOW}Test training cancelled.{Colors.RESET}")
             return False
-        
+
+        # Market selection
+        selected_market = self.detect_and_select_market()
+        if selected_market is None:
+            print(f"{Colors.YELLOW}Test training cancelled - no market selected.{Colors.RESET}")
+            return False
+
         # Phase 1 Test Training
         phase1_script = self.src_dir / "train_phase1.py"
         if phase1_script.exists():
             print(f"\n{Colors.GREEN}Starting Phase 1 Test Training...{Colors.RESET}")
-            command = [sys.executable, str(phase1_script), "--test"]
+            command = [sys.executable, str(phase1_script), "--test", "--market", selected_market, "--non-interactive"]
             success, output = self.run_command_with_progress(
                 command,
                 "Phase 1 Test Training",
@@ -659,7 +743,7 @@ class RLTrainerMenu:
         phase2_script = self.src_dir / "train_phase2.py"
         if phase2_script.exists():
             print(f"\n{Colors.GREEN}Starting Phase 2 Test Training...{Colors.RESET}")
-            command = [sys.executable, str(phase2_script), "--test"]
+            command = [sys.executable, str(phase2_script), "--test", "--market", selected_market, "--non-interactive"]
             success, output = self.run_command_with_progress(
                 command,
                 "Phase 2 Test Training",
@@ -679,7 +763,7 @@ class RLTrainerMenu:
         print(f"\n{Colors.BOLD}{Colors.YELLOW}TRAINING PRODUCTION MODE{Colors.RESET}")
         print(f"{Colors.CYAN}This will run full production training on the complete dataset.{Colors.RESET}")
         print(f"{Colors.RED}Warning: This may take several hours to complete.{Colors.RESET}")
-        
+
         # Confirm
         confirm = self.get_user_input(
             f"{Colors.YELLOW}Proceed with production training? (y/n): {Colors.RESET}",
@@ -689,12 +773,18 @@ class RLTrainerMenu:
         if confirm is None or confirm.lower() != 'y':
             print(f"{Colors.YELLOW}Production training cancelled.{Colors.RESET}")
             return False
-        
+
+        # Market selection
+        selected_market = self.detect_and_select_market()
+        if selected_market is None:
+            print(f"{Colors.YELLOW}Production training cancelled - no market selected.{Colors.RESET}")
+            return False
+
         # Phase 1 Production Training
         phase1_script = self.src_dir / "train_phase1.py"
         if phase1_script.exists():
             print(f"\n{Colors.GREEN}Starting Phase 1 Production Training...{Colors.RESET}")
-            command = [sys.executable, str(phase1_script)]
+            command = [sys.executable, str(phase1_script), "--market", selected_market, "--non-interactive"]
             success, output = self.run_command_with_progress(
                 command,
                 "Phase 1 Production Training",
@@ -709,7 +799,7 @@ class RLTrainerMenu:
         phase2_script = self.src_dir / "train_phase2.py"
         if phase2_script.exists():
             print(f"\n{Colors.GREEN}Starting Phase 2 Production Training...{Colors.RESET}")
-            command = [sys.executable, str(phase2_script)]
+            command = [sys.executable, str(phase2_script), "--market", selected_market, "--non-interactive"]
             success, output = self.run_command_with_progress(
                 command,
                 "Phase 2 Production Training",
@@ -788,6 +878,12 @@ class RLTrainerMenu:
             print(f"{Colors.YELLOW}Training cancelled.{Colors.RESET}")
             return False
 
+        # Market selection
+        selected_market = self.detect_and_select_market()
+        if selected_market is None:
+            print(f"{Colors.YELLOW}Training cancelled - no market selected.{Colors.RESET}")
+            return False
+
         # Run Phase 1 training with continuation
         phase1_script = self.src_dir / "train_phase1.py"
         if not phase1_script.exists():
@@ -797,7 +893,7 @@ class RLTrainerMenu:
         print(f"\n{Colors.GREEN}Starting Phase 1 Continuation Training ({mode_name} Mode)...{Colors.RESET}")
 
         # Build command with --continue flag
-        command = [sys.executable, str(phase1_script), "--continue", "--model-path", selected_model['path']]
+        command = [sys.executable, str(phase1_script), "--continue", "--model-path", selected_model['path'], "--market", selected_market, "--non-interactive"]
         if test_mode:
             command.append("--test")
 
@@ -838,9 +934,15 @@ class RLTrainerMenu:
         if confirm is None or confirm.lower() != 'y':
             print(f"{Colors.YELLOW}Evaluation cancelled.{Colors.RESET}")
             return False
-        
+
+        # Market selection
+        selected_market = self.detect_and_select_market()
+        if selected_market is None:
+            print(f"{Colors.YELLOW}Evaluation cancelled - no market selected.{Colors.RESET}")
+            return False
+
         # Run evaluation
-        command = [sys.executable, str(eval_script)]
+        command = [sys.executable, str(eval_script), "--market", selected_market, "--non-interactive"]
         success, output = self.run_command_with_progress(
             command,
             "Model Evaluation",

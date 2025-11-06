@@ -10,11 +10,14 @@ from datetime import datetime
 import sys
 import os
 
-# Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add parent directory and src directory to path
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, parent_dir)
+sys.path.insert(0, os.path.join(parent_dir, 'src'))
 
-from environment_phase1 import TradingEnvironmentPhase1
-from environment_phase2 import TradingEnvironmentPhase2
+from src.environment_phase1 import TradingEnvironmentPhase1
+from src.environment_phase2 import TradingEnvironmentPhase2
+from src.market_specs import ES_SPEC, NQ_SPEC, MES_SPEC
 
 
 class TestTradingEnvironmentPhase1(unittest.TestCase):
@@ -507,6 +510,66 @@ class TestComprehensiveScenarios(unittest.TestCase):
         obs, reward, terminated, truncated, info = env.step(2)  # Sell
         self.assertEqual(env.position, -1)
         self.assertGreater(env.num_trades, trade_count_1)
+
+    def test_multi_market_support(self):
+        """Test that different markets have correct contract specs."""
+        # Test ES
+        env_es = TradingEnvironmentPhase1(
+            self.test_data,
+            market_spec=ES_SPEC
+        )
+        self.assertEqual(env_es.contract_size, 50.0)
+        self.assertEqual(env_es.tick_size, 0.25)
+        self.assertEqual(env_es.market_symbol, 'ES')
+
+        # Test NQ
+        env_nq = TradingEnvironmentPhase1(
+            self.test_data,
+            market_spec=NQ_SPEC
+        )
+        self.assertEqual(env_nq.contract_size, 20.0)
+        self.assertEqual(env_nq.tick_size, 0.25)
+        self.assertEqual(env_nq.market_symbol, 'NQ')
+
+        # Test MES
+        env_mes = TradingEnvironmentPhase1(
+            self.test_data,
+            market_spec=MES_SPEC
+        )
+        self.assertEqual(env_mes.contract_size, 5.0)
+        self.assertEqual(env_mes.market_symbol, 'MES')
+
+    def test_pnl_calculations_per_market(self):
+        """Verify P&L is correctly calculated for different markets."""
+        # ES: 10 point move with 1 contract = $500
+        env_es = TradingEnvironmentPhase1(self.test_data, market_spec=ES_SPEC, position_size_contracts=1.0)
+        env_es.reset()
+        env_es.position = 1
+        env_es.entry_price = 4000.0
+        env_es.position_size = 1.0
+
+        pnl_es = (4010.0 - 4000.0) * env_es.contract_size * 1.0  # 10 * 50 * 1 = 500
+        self.assertEqual(pnl_es, 500.0)
+
+        # NQ: 10 point move with 1 contract = $200
+        env_nq = TradingEnvironmentPhase1(self.test_data, market_spec=NQ_SPEC, position_size_contracts=1.0)
+        env_nq.reset()
+        env_nq.position = 1
+        env_nq.entry_price = 15000.0
+        env_nq.position_size = 1.0
+
+        pnl_nq = (15010.0 - 15000.0) * env_nq.contract_size * 1.0  # 10 * 20 * 1 = 200
+        self.assertEqual(pnl_nq, 200.0)
+
+    def test_commission_override(self):
+        """Test commission override functionality."""
+        # Default commission
+        env_default = TradingEnvironmentPhase1(self.test_data, market_spec=ES_SPEC)
+        self.assertEqual(env_default.commission_per_side, 2.50)
+
+        # Override commission
+        env_custom = TradingEnvironmentPhase1(self.test_data, market_spec=ES_SPEC, commission_override=1.00)
+        self.assertEqual(env_custom.commission_per_side, 1.00)
 
 
 if __name__ == '__main__':

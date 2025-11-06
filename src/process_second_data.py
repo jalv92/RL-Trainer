@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Process 1-second ES futures data for real-time trailing drawdown calculation
+Process 1-second futures data for real-time trailing drawdown calculation
+
+Market-agnostic processing for all futures markets (ES, NQ, YM, RTY, etc.)
 
 Input: Raw 1-second OHLCV data from GLBX
 Output: Clean 1-second data compatible with training environments
@@ -13,10 +15,19 @@ from datetime import datetime
 import sys
 from zoneinfo import ZoneInfo
 
+# Import centralized validation module
+try:
+    from data_validator import detect_and_fix_price_format
+except ImportError:
+    # Fallback if running from different directory
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from data_validator import detect_and_fix_price_format
+
 
 def load_raw_second_data(file_path):
     """Load raw 1-second OHLCV data"""
-    print(f"[1/6] Loading raw 1-second data from {file_path}...")
+    print(f"[1/7] Loading raw 1-second data from {file_path}...")
 
     try:
         df = pd.read_csv(file_path, low_memory=False)
@@ -30,7 +41,7 @@ def load_raw_second_data(file_path):
 
 def filter_es_contracts(df, market='ES'):
     """Filter for futures contracts based on market prefix (ES, NQ, YM, etc.)"""
-    print(f"\n[2/6] Filtering for {market} futures contracts...")
+    print(f"\n[2/7] Filtering for {market} futures contracts...")
 
     # Get all unique symbols that start with the market prefix
     market_symbols = [sym for sym in df['symbol'].unique() if str(sym).startswith(market)]
@@ -48,7 +59,7 @@ def filter_es_contracts(df, market='ES'):
 
 def create_continuous_contract(df_filtered):
     """Create continuous contract data by handling contract rollovers"""
-    print(f"\n[3/6] Creating continuous contract...")
+    print(f"\n[3/7] Creating continuous contract...")
 
     # Sort by timestamp
     df_filtered = df_filtered.sort_values('ts_event')
@@ -86,7 +97,7 @@ def create_continuous_contract(df_filtered):
 
 def convert_timestamp_and_timezone(df):
     """Convert timestamp to US/Eastern timezone"""
-    print(f"\n[4/6] Converting timezone...")
+    print(f"\n[4/7] Converting timezone...")
 
     # Parse timestamp (utc=True handles the Z suffix and UTC timezone)
     df['ts_event'] = pd.to_datetime(df['ts_event'], utc=True)
@@ -104,7 +115,7 @@ def convert_timestamp_and_timezone(df):
 
 def filter_trading_hours(df):
     """Filter for Apex trading hours (8:30 AM - 4:59 PM ET)"""
-    print(f"\n[5/6] Filtering for Apex trading hours (8:30 AM - 4:59 PM ET)...")
+    print(f"\n[5/7] Filtering for Apex trading hours (8:30 AM - 4:59 PM ET)...")
 
     # Extract hour and minute
     df['hour'] = df.index.hour
@@ -132,7 +143,7 @@ def filter_trading_hours(df):
 
 def extract_ohlcv_only(df):
     """Extract only OHLCV columns"""
-    print(f"\n[6/6] Extracting OHLCV data...")
+    print(f"\n[6/7] Extracting OHLCV data...")
 
     # Keep only OHLCV
     required_cols = ['open', 'high', 'low', 'close', 'volume']
@@ -215,6 +226,15 @@ def main(input_file=None, output_path=None, market='ES'):
         # Step 6: Extract OHLCV only
         df = extract_ohlcv_only(df)
 
+        # Step 7: Validate and fix price format (CRITICAL: detect divide-by-100 errors)
+        print(f"\n[7/7] Validating and fixing price format...")
+        df, format_stats = detect_and_fix_price_format(df, market, verbose=True)
+
+        if format_stats['fixed_count'] > 0:
+            print(f"      ✅ Corrected {format_stats['fixed_count']:,} corrupted bars ({format_stats['fixed_pct']:.1f}%)")
+        else:
+            print(f"      ✅ No price format issues detected")
+
         # Save
         save_processed_data(df, output_path)
 
@@ -236,10 +256,11 @@ def main(input_file=None, output_path=None, market='ES'):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='Process 1-second ES futures data')
+    parser = argparse.ArgumentParser(description='Process 1-second futures data (market-agnostic)')
     parser.add_argument('--input', type=str, help='Input 1s OHLCV CSV file path')
     parser.add_argument('--output', type=str, help='Output processed CSV file path')
+    parser.add_argument('--market', type=str, default='ES', help='Market to process (ES, NQ, YM, etc.)')
     args = parser.parse_args()
 
-    success = main(input_file=args.input, output_path=args.output)
+    success = main(input_file=args.input, output_path=args.output, market=args.market)
     sys.exit(0 if success else 1)

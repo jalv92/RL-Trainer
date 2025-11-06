@@ -48,6 +48,7 @@ if os.name == 'nt':  # Windows
 # Import local modules
 from technical_indicators import add_all_indicators
 from feature_engineering import add_market_regime_features
+from data_validator import detect_and_fix_price_format
 import process_second_data
 import clean_second_data
 
@@ -92,6 +93,19 @@ class DataUpdatePipeline:
         self.dry_run = dry_run
         self.temp_dirs = []
         self.zip_files = []
+
+        # Expected median prices for corruption detection
+        # Updated Nov 2025 to current market levels
+        self.expected_medians = {
+            'ES': 6400,      # E-mini S&P 500: updated from 5500 (Nov 2025 levels: 6200-6500)
+            'NQ': 24000,     # E-mini Nasdaq-100: updated from 18000 (Nov 2025 levels: 23000-25000)
+            'YM': 44000,     # E-mini Dow: updated from 35000 (Nov 2025 levels: 42000-46000)
+            'RTY': 2200,     # E-mini Russell 2000: updated from 2100 (Nov 2025 levels: 2100-2300)
+            'MES': 6400,     # Micro E-mini S&P 500: same as ES
+            'MNQ': 24000,    # Micro E-mini Nasdaq-100: same as NQ
+            'M2K': 2200,     # Micro E-mini Russell 2000: same as RTY
+            'MYM': 44000,    # Micro E-mini Dow: same as YM
+        }
 
         # Set output filenames based on market prefix
         if self.market:
@@ -207,6 +221,28 @@ class DataUpdatePipeline:
                 else:
                     # If no market specified, try to detect from symbols
                     safe_print(f"    No market filter applied: {len(df):,} rows")
+
+            # Pre-flight data quality check (gives early warning about corruption)
+            safe_print("\n  [PRE-FLIGHT CHECK] Analyzing data quality...")
+            if len(df) > 0 and 'close' in df.columns:
+                actual_median = df['close'].median()
+                expected_median = self.expected_medians.get(self.market, 5000)
+
+                if actual_median < expected_median * 0.20:
+                    ratio = expected_median / actual_median
+                    safe_print(f"    ⚠️  WARNING: Data appears corrupted!")
+                    safe_print(f"    Expected median: ${expected_median:,.2f}")
+                    safe_print(f"    Actual median: ${actual_median:,.2f} ({ratio:.1f}x too low)")
+                    safe_print(f"    → Auto-correction will be applied...")
+                else:
+                    safe_print(f"    ✅ Data quality looks good (median: ${actual_median:,.2f})")
+
+            # Detect and fix price format corruption (CRITICAL: Do this before any processing)
+            df, format_stats = detect_and_fix_price_format(df, self.market, verbose=True)
+
+            # Show fix summary if corruption was detected
+            if format_stats['fixed_count'] > 0:
+                safe_print(f"  ✅ Corrected {format_stats['fixed_count']:,} corrupted bars ({format_stats['fixed_pct']:.1f}%)")
 
             # Parse timestamp
             if 'ts_event' in df.columns:
@@ -408,7 +444,7 @@ class DataUpdatePipeline:
         else:
             try:
                 result = subprocess.run(
-                    ['python', 'diagnose_environment.py', '--phase', '1', '--steps', '100'],
+                    ['python', 'diagnose_environment.py', '--phase', '1', '--steps', '100', '--market', self.market],
                     cwd=os.path.dirname(os.path.abspath(__file__)),
                     capture_output=True,
                     text=True,

@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "Bash(git reset:*)",
-      "Bash(git config:*)"
+      "Bash(git config:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(python3:*)",
+      "Bash(python -c:*)",
+      "Bash(PYTHONPATH=/mnt/c/Users/javlo/Documents/Code Projects/tensortrade/AI Trainer python3 src/train_phase1.py --help)",
+      "Bash(PYTHONPATH=/mnt/c/Users/javlo/Documents/Code Projects/tensortrade/AI Trainer python3:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(PYTHONPATH=\"/mnt/c/Users/javlo/Documents/Code Projects/tensortrade/AI Trainer\" python3:*)",
+      "Bash(export PYTHONPATH=\"/mnt/c/Users/javlo/Documents/Code Projects/tensortrade/AI Trainer\")"
     ],
     "deny": [],
     "ask": []

@@ -49,10 +49,12 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
-from environment_phase1 import TradingEnvironmentPhase1
-from kl_callback import KLDivergenceCallback
-from feature_engineering import add_market_regime_features
-from model_utils import get_model_save_name, detect_available_markets, select_market_for_training
+from src.environment_phase1 import TradingEnvironmentPhase1
+from src.kl_callback import KLDivergenceCallback
+from src.feature_engineering import add_market_regime_features
+from src.model_utils import get_model_save_name, detect_available_markets, select_market_for_training
+from src.market_specs import get_market_spec
+from src.metadata_utils import write_metadata
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -163,11 +165,14 @@ PHASE1_CONFIG = {
     # Environment parameters
     'window_size': 20,
     'initial_balance': 50000,
-    'fixed_sl_multiplier': 1.5,
-    'fixed_tp_ratio': 3.0,
+    'initial_sl_multiplier': 1.5,
+    'initial_tp_ratio': 3.0,
     'position_size': 0.5,
     'trailing_dd_limit': 5000,  # Relaxed for Phase 1
     'episode_length': 390,  # NEW: 1 trading day
+
+    # Market specifications (optional override)
+    'commission_override': None,  # None = use market default, or set custom value (e.g., 1.50)
 
     # Evaluation - More frequent for better early stopping
     'eval_freq': 50_000,  # Every 50K = 40 evals max (2M / 50K)
@@ -352,7 +357,7 @@ def load_data(train_split=0.7, market=None):
     return train_data, val_data, train_second_data, val_second_data
 
 
-def make_env(data, second_data, env_id, config):
+def make_env(data, second_data, env_id, config, market_spec):
     """
     Create environment factory with random episode starts to prevent temporal leakage.
 
@@ -402,8 +407,10 @@ def make_env(data, second_data, env_id, config):
             window_size=config['window_size'],
             initial_balance=config['initial_balance'],
             second_data=env_second_data,  # Pass second-level data
-            fixed_sl_atr_multiplier=config['fixed_sl_multiplier'],
-            fixed_tp_to_sl_ratio=config['fixed_tp_ratio'],
+            market_spec=market_spec,  # NEW: Pass market spec
+            commission_override=config.get('commission_override', None),  # NEW: Optional override
+            initial_sl_multiplier=config['initial_sl_multiplier'],
+            initial_tp_ratio=config['initial_tp_ratio'],
             position_size_contracts=config['position_size'],
             trailing_drawdown_limit=config['trailing_dd_limit']
         )
@@ -413,12 +420,20 @@ def make_env(data, second_data, env_id, config):
     return _init
 
 
-def train_phase1(continue_training=False, model_path=None):
+def train_phase1(
+    continue_training=False,
+    model_path=None,
+    market_override=None,
+    non_interactive=False,
+    test_mode=False,
+):
     """Execute Phase 1 training.
 
     Args:
         continue_training: If True, load and continue training from existing model
         model_path: Path to existing model to continue from
+        market_override: Optional market symbol to use (ES, NQ, etc.). If None, will prompt interactively.
+        non_interactive: If True, run in non-interactive mode (no prompts, use defaults)
     """
     if continue_training:
         safe_print("=" * 80)
@@ -434,13 +449,31 @@ def train_phase1(continue_training=False, model_path=None):
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(script_dir, 'data')
     available_markets = detect_available_markets(data_dir)
-    selected_market = select_market_for_training(available_markets, safe_print)
 
-    if selected_market is None:
-        safe_print("\n[ERROR] No market selected. Exiting training.")
-        return  # User cancelled or no data
+    # If market override provided via CLI, use it directly
+    if market_override:
+        from src.market_specs import get_market_spec
+        market_spec = get_market_spec(market_override.upper())
+        if market_spec is None:
+            safe_print(f"\n[ERROR] Invalid market symbol: {market_override}")
+            safe_print("[ERROR] Valid markets: ES, NQ, YM, RTY, MNQ, MES, M2K, MYM")
+            return
+        # Find the matching market data
+        selected_market = next((m for m in available_markets if m['market'] == market_override.upper()), None)
+        if selected_market is None:
+            safe_print(f"\n[ERROR] No data found for market: {market_override}")
+            safe_print(f"[ERROR] Available markets: {', '.join([m['market'] for m in available_markets])}")
+            return
+        market_name = market_override.upper()
+        safe_print(f"\n[CLI] Market specified via --market: {market_name}")
+    else:
+        # Interactive market selection
+        selected_market, market_spec = select_market_for_training(available_markets, safe_print)
+        if selected_market is None or market_spec is None:
+            safe_print("\n[INFO] Training cancelled - no market selected")
+            return  # User cancelled or no data
+        market_name = selected_market['market']
 
-    market_name = selected_market['market']
     safe_print(f"\n[TRAINING] Market: {market_name}")
 
     safe_print(f"[CONFIG] Total timesteps: {PHASE1_CONFIG['total_timesteps']:,}")
@@ -454,8 +487,8 @@ def train_phase1(continue_training=False, model_path=None):
     safe_print(f"[SYSTEM] BLAS threads per process: {os.environ.get('OPENBLAS_NUM_THREADS', 'unknown')}")
     safe_print(f"[CONFIG] Network: {PHASE1_CONFIG['policy_layers']}")
     safe_print(f"[CONFIG] Device: {PHASE1_CONFIG['device']}")
-    safe_print(f"[CONFIG] Fixed SL: {PHASE1_CONFIG['fixed_sl_multiplier']}x ATR")
-    safe_print(f"[CONFIG] Fixed TP: {PHASE1_CONFIG['fixed_tp_ratio']}x SL")
+    safe_print(f"[CONFIG] Fixed SL: {PHASE1_CONFIG['initial_sl_multiplier']}x ATR")
+    safe_print(f"[CONFIG] Fixed TP: {PHASE1_CONFIG['initial_tp_ratio']}x SL")
     safe_print("")
 
     # Create directories
@@ -469,7 +502,7 @@ def train_phase1(continue_training=False, model_path=None):
 
     # Create vectorized training environments (use TRAIN data only)
     safe_print(f"\n[ENV] Creating {num_envs} parallel TRAINING environments...")
-    env_fns = [make_env(train_data, train_second_data, i, PHASE1_CONFIG) for i in range(num_envs)]
+    env_fns = [make_env(train_data, train_second_data, i, PHASE1_CONFIG, market_spec) for i in range(num_envs)]
 
     if num_envs > 1:
         env = SubprocVecEnv(env_fns)
@@ -494,8 +527,10 @@ def train_phase1(continue_training=False, model_path=None):
         window_size=PHASE1_CONFIG['window_size'],
         initial_balance=PHASE1_CONFIG['initial_balance'],
         second_data=val_second_data,  # CHANGED: Use val second-level data
-        fixed_sl_atr_multiplier=PHASE1_CONFIG['fixed_sl_multiplier'],
-        fixed_tp_to_sl_ratio=PHASE1_CONFIG['fixed_tp_ratio'],
+        market_spec=market_spec,  # NEW: Pass market spec
+        commission_override=PHASE1_CONFIG.get('commission_override', None),  # NEW
+        initial_sl_multiplier=PHASE1_CONFIG['initial_sl_multiplier'],
+        initial_tp_ratio=PHASE1_CONFIG['initial_tp_ratio'],
         position_size_contracts=PHASE1_CONFIG['position_size'],
         trailing_drawdown_limit=PHASE1_CONFIG['trailing_dd_limit']
     ))])
@@ -662,14 +697,28 @@ def train_phase1(continue_training=False, model_path=None):
     else:
         default_name = "phase1_foundational_final"
 
+    if test_mode and not default_name.endswith('_test'):
+        default_name = f"{default_name}_test"
+        safe_print("[SAVE] Test mode run detected - using '_test' suffix for artifacts")
+
     # Get save name from user (interactive mode only)
-    if sys.stdin.isatty():  # Check if running interactively
+    # Detect if we're in a truly interactive context
+    is_interactive = (not non_interactive and
+                      sys.stdin.isatty() and
+                      hasattr(sys.stdin, 'readable'))
+
+    if is_interactive:
         try:
-            save_name = get_model_save_name(default_name)
-        except:
-            # Fallback if there's an issue with the prompt
+            # Additional check: stdin might be a TTY but not actually readable
+            if sys.stdin.readable():
+                save_name = get_model_save_name(default_name)
+            else:
+                save_name = default_name
+                safe_print(f"[SAVE] Non-interactive mode - using default name: {save_name}")
+        except (EOFError, OSError):
+            # stdin not actually available despite isatty()
             save_name = default_name
-            safe_print(f"[SAVE] Using default name: {save_name}")
+            safe_print(f"[SAVE] Non-interactive mode - using default name: {save_name}")
     else:
         # Non-interactive mode (e.g., called from menu script)
         save_name = default_name
@@ -680,6 +729,18 @@ def train_phase1(continue_training=False, model_path=None):
 
     model.save(model_save_path)
     env.save(vecnorm_save_path)
+
+    metadata_common = {
+        'phase': 1,
+        'market': market_name,
+        'total_timesteps': int(model.num_timesteps),
+        'timesteps_target': int(PHASE1_CONFIG['total_timesteps']),
+        'test_mode': bool(test_mode),
+        'continue_training': bool(continue_training),
+    }
+
+    write_metadata(model_save_path, {**metadata_common, 'artifact': 'model'})
+    write_metadata(vecnorm_save_path, {**metadata_common, 'artifact': 'vecnormalize'})
 
     safe_print("\n" + "=" * 80)
     safe_print("PHASE 1 TRAINING COMPLETE!")
@@ -708,6 +769,10 @@ if __name__ == '__main__':
                        help='Continue training from an existing model')
     parser.add_argument('--model-path', type=str, default=None,
                        help='Path to the model to continue training from')
+    parser.add_argument('--market', type=str, default=None,
+                       help='Market to train on (ES, NQ, YM, RTY, MNQ, MES, M2K, MYM). If not specified, will prompt interactively.')
+    parser.add_argument('--non-interactive', action='store_true',
+                       help='Run in non-interactive mode (no prompts, use defaults)')
     args = parser.parse_args()
 
     # Override config for test mode (quick local testing)
@@ -744,4 +809,10 @@ if __name__ == '__main__':
     np.random.seed(42)
     torch.manual_seed(42)
 
-    train_phase1(continue_training=args.continue_training, model_path=args.model_path)
+    train_phase1(
+        continue_training=args.continue_training,
+        model_path=args.model_path,
+        market_override=args.market,
+        non_interactive=args.non_interactive,
+        test_mode=args.test,
+    )

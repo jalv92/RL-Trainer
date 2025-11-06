@@ -51,9 +51,13 @@ AI Trainer/
 │   ├── technical_indicators.py  # Technical indicators
 │   ├── kl_callback.py           # KL divergence monitoring
 │   ├── model_utils.py           # Model detection and loading utilities
+│   ├── market_specs.py          # Market specifications (8 futures markets)
 │   ├── train_phase1.py          # Phase 1 training script
 │   ├── train_phase2.py          # Phase 2 training script
 │   ├── evaluate_phase2.py       # Model evaluation
+│   ├── data_validator.py        # ⭐ NEW: Centralized data validation
+│   ├── process_new_data.py      # ⭐ NEW: Process new data (auto corruption fix)
+│   ├── reprocess_from_source.py # ⭐ NEW: Reprocess old corrupted data
 │   ├── update_training_data.py  # Data processing script
 │   ├── clean_second_data.py     # Second-level data cleaning
 │   └── process_second_data.py   # Second-level data processing
@@ -82,7 +86,9 @@ AI Trainer/
 │   └── test_integration.py      # Integration tests
 │
 ├── docs/                        # Documentation
-│   └── Apex-Rules.md            # Apex Trader Funding compliance rules
+│   ├── Apex-Rules.md            # Apex Trader Funding compliance rules
+│   ├── QUICK_START_DATA_PROCESSING.md  # ⭐ NEW: Quick start data guide
+│   └── DATA_REPROCESSING_GUIDE.md      # ⭐ NEW: Detailed reprocessing guide
 │
 └── tensortrade/                 # TensorTrade package source
     └── (complete package)
@@ -172,11 +178,36 @@ python src/train_phase1.py --continue --model-path models/phase1_foundational_fi
 
 #### 1. Process Data
 
+**NEW: Automatic corruption detection and fixing!** 🎉
+
+When you download new data from Databento, just run:
+
 ```bash
+# Process new data with automatic corruption detection & fixing
+python src/process_new_data.py --market NQ
+```
+
+The script automatically:
+- ✅ Detects corrupted data (divide-by-100 errors)
+- ✅ Fixes corruption automatically
+- ✅ Validates data quality
+- ✅ Generates clean training-ready data
+
+**Alternative (direct processing):**
+```bash
+# Also has automatic corruption detection built-in
 python src/update_training_data.py --market ES
 ```
 
-Available markets: NQ, ES, YM, RTY, MNQ, MES, M2K, MYM
+**Reprocess old corrupted data:**
+```bash
+# Deletes old files and reprocesses from source
+python src/reprocess_from_source.py --market NQ
+```
+
+**Available markets:** NQ, ES, YM, RTY, MNQ, MES, M2K, MYM
+
+📖 **See:** `docs/QUICK_START_DATA_PROCESSING.md` for detailed guide
 
 #### 2. Train Models
 
@@ -206,6 +237,70 @@ python src/evaluate_phase2.py
 ```bash
 tensorboard --logdir tensorboard_logs/
 ```
+
+## 🌍 Multi-Market Support
+
+The RL Trainer supports **8 different futures markets** with automatic contract specification handling:
+
+### Supported Markets
+
+| Symbol | Name | Contract Size | Tick Size | Tick Value | Default Commission | Type |
+|--------|------|--------------|-----------|-----------|-------------------|------|
+| **ES** | E-mini S&P 500 | $50 | 0.25 | $12.50 | $2.50/side | E-mini |
+| **NQ** | E-mini Nasdaq-100 | $20 | 0.25 | $5.00 | $2.50/side | E-mini |
+| **YM** | E-mini Dow Jones | $5 | 1.0 | $5.00 | $2.50/side | E-mini |
+| **RTY** | E-mini Russell 2000 | $50 | 0.10 | $5.00 | $2.50/side | E-mini |
+| **MNQ** | Micro E-mini Nasdaq | $2 | 0.25 | $0.50 | $0.60/side | Micro |
+| **MES** | Micro E-mini S&P 500 | $5 | 0.25 | $1.25 | $0.60/side | Micro |
+| **M2K** | Micro E-mini Russell | $5 | 0.10 | $0.50 | $0.60/side | Micro |
+| **MYM** | Micro E-mini Dow | $0.50 | 1.0 | $0.50 | $0.60/side | Micro |
+
+### How It Works
+
+1. **Process data** for your desired market (e.g., NQ)
+2. **Start training** - the system automatically:
+   - Detects available market data files
+   - Prompts you to select a market (if multiple exist)
+   - Loads correct contract specifications
+   - Applies market-specific P&L calculations, commissions, and slippage
+
+### Example: Training on Multiple Markets
+
+```bash
+# Process NQ data
+python main.py
+# Select: Data Processing → NQ
+
+# Train on NQ
+python main.py
+# Select: Training Model → Training Pod
+# System shows: "Detected 2 markets: ES, NQ"
+# Select: NQ
+# Training uses NQ specs automatically!
+```
+
+### Custom Commission Override
+
+You can override default commissions in training configs:
+
+```python
+# train_phase1.py or train_phase2.py
+PHASE1_CONFIG = {
+    # ... other config ...
+    'commission_override': 1.50  # Use custom commission instead of market default
+}
+```
+
+### Market-Dependent Features
+
+- **P&L Calculations**: Automatically use correct contract multiplier
+- **Slippage Modeling**:
+  - Liquid markets (ES, NQ, MNQ, MES) = 1 tick slippage
+  - Less liquid (YM, RTY, M2K, MYM) = 2 ticks slippage
+- **Commissions**:
+  - E-mini default = $2.50/side
+  - Micro default = $0.60/side
+  - Fully configurable per training run
 
 ## System Architecture
 

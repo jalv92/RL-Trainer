@@ -16,7 +16,8 @@ from typing import Tuple, Dict, Optional
 import gymnasium as gym
 from gymnasium import spaces
 from datetime import datetime
-from environment_phase1 import TradingEnvironmentPhase1
+from src.environment_phase1 import TradingEnvironmentPhase1
+from src.market_specs import MarketSpecification
 
 
 class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
@@ -45,6 +46,9 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         initial_balance: float = 50000,
         window_size: int = 20,
         second_data: pd.DataFrame = None,
+        # Market specifications
+        market_spec: MarketSpecification = None,
+        commission_override: float = None,
         # Phase 2 specific
         initial_sl_multiplier: float = 1.5,
         initial_tp_ratio: float = 3.0,
@@ -58,6 +62,12 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         Initialize Phase 2 environment with position management.
 
         Args:
+            data: OHLCV + indicators DataFrame
+            initial_balance: Starting capital
+            window_size: Lookback window
+            second_data: Optional second-level data
+            market_spec: Market specification object (defaults to ES if None)
+            commission_override: Override default commission
             initial_sl_multiplier: Initial SL distance (can be adjusted)
             initial_tp_ratio: Initial TP ratio (can be adjusted)
             position_size_contracts: Full position size (1.0 for Apex)
@@ -66,9 +76,10 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             extend_tp_step: Amount to extend TP by (in ATR units)
             trailing_activation_profit: Min profit (in R) to enable trailing
         """
-        # Initialize parent class (Phase 1)
+        # Initialize parent class (Phase 1) with market specs
         super().__init__(
             data, initial_balance, window_size, second_data,
+            market_spec, commission_override,  # Pass market specs
             initial_sl_multiplier, initial_tp_ratio, position_size_contracts,
             trailing_drawdown_limit
         )
@@ -97,6 +108,10 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         self.sell_count = 0
         self.action_diversity_window = 100  # Track last 100 actions
 
+        # Diagnostics
+        self.last_action_mask = None
+        self.last_done_reason = None
+
 
     def reset(self, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
         """Reset with Phase 2 tracking."""
@@ -112,6 +127,18 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         self.sell_count = 0
         self.action_diversity_window = 100  # Track last 100 actions
 
+        # Diagnostics
+        self.last_action_mask = None
+        self.last_done_reason = None
+
+        if info is None:
+            info = {}
+
+        info.update({
+            'data_length': len(self.data),
+            'window_size': self.window_size,
+            'market_symbol': getattr(self, 'market_symbol', None),
+        })
 
         # Phase 2 specific position management parameters are already set in __init__
         # No need to re-assign them here
@@ -133,7 +160,20 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             5: Disable trailing stop (was 8)
         """
         if self.current_step >= len(self.data) - 1:
-            return self._get_observation(), 0.0, False, True, {}
+            obs = self._get_observation()
+            info = {
+                'portfolio_value': self.balance,
+                'position': self.position,
+                'num_trades': self.num_trades,
+                'balance': self.balance,
+                'done_reason': 'data_exhausted',
+                'action_mask': self._last_action_mask_as_list(),
+                'observation_quality': self._observation_quality(obs),
+                'step_index': self.current_step,
+                'remaining_bars': 0,
+            }
+            self.last_done_reason = 'data_exhausted'
+            return obs, 0.0, False, True, info
 
         current_price = self.data['close'].iloc[self.current_step]
         high = self.data['high'].iloc[self.current_step]
@@ -143,6 +183,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         reward = 0.0
         terminated = False
         truncated = False
+        done_reason = None
         position_changed = False
         trade_pnl = 0.0
         exit_reason = None
@@ -318,6 +359,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         if portfolio_value < self.trailing_dd_level:
             terminated = True
             reward = -0.1
+            done_reason = 'minute_trailing_drawdown'
 
         # Check violation at second-level (Apex compliance)
         if not terminated and self.second_data is not None:
@@ -326,6 +368,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             if drawdown_hit:
                 terminated = True
                 reward = -0.1  # Heavy penalty for Apex violation
+                done_reason = 'second_level_trailing_drawdown'
 
         # ============================================================
         # 5. CALCULATE REWARD (Apex-Optimized)
@@ -343,6 +386,8 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
 
         if self.current_step >= len(self.data) - 1:
             truncated = True
+            if done_reason is None:
+                done_reason = 'end_of_data'
 
         obs = self._get_observation()
         info = {
@@ -351,10 +396,54 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             'pm_action': pm_action_taken,
             'be_moves': self.be_move_count,
             'num_trades': self.num_trades,
-            'balance': self.balance
+            'balance': self.balance,
+            'unrealized_pnl': unrealized_pnl,
+            'action_mask': self._last_action_mask_as_list(),
+            'observation_quality': self._observation_quality(obs),
+            'step_index': self.current_step,
+            'prev_step_index': self.current_step - 1,
+            'remaining_bars': max(len(self.data) - self.current_step, 0),
+            'bar_timestamp': str(self.data.index[min(self.current_step - 1, len(self.data) - 1)]),
+            'done_reason': done_reason,
         }
 
+        if done_reason:
+            self.last_done_reason = done_reason
+
         return obs, reward, terminated, truncated, info
+
+    def _last_action_mask_as_list(self):
+        if self.last_action_mask is None:
+            return None
+        return self.last_action_mask.astype(bool).tolist()
+
+    def _observation_quality(self, obs: np.ndarray) -> Dict[str, float]:
+        if obs is None:
+            return {
+                'has_nan': False,
+                'has_inf': False,
+                'min': float('nan'),
+                'max': float('nan'),
+            }
+
+        obs = np.asarray(obs)
+        has_nan = bool(np.isnan(obs).any())
+        has_inf = bool(np.isinf(obs).any())
+        finite_mask = np.isfinite(obs)
+        if finite_mask.any():
+            finite_vals = obs[finite_mask]
+            min_val = float(finite_vals.min())
+            max_val = float(finite_vals.max())
+        else:
+            min_val = float('nan')
+            max_val = float('nan')
+
+        return {
+            'has_nan': has_nan,
+            'has_inf': has_inf,
+            'min': min_val,
+            'max': max_val,
+        }
 
     def _move_sl_to_breakeven(self, current_price: float) -> bool:
         """

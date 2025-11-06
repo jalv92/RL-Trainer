@@ -359,21 +359,33 @@ def select_market_for_training(markets, safe_print_func=print):
         safe_print_func: Print function to use (for Windows compatibility)
 
     Returns:
-        Selected market dict, or None if cancelled
+        Tuple of (selected market dict, MarketSpecification object), or (None, None) if cancelled
     """
+    from src.market_specs import get_market_spec
+
     if not markets:
         safe_print_func("\n[ERROR] No market data files found!")
         safe_print_func("[ERROR] Please run data processing first to create training data.")
-        return None
+        return None, None
 
     if len(markets) == 1:
         # Only one dataset - use it automatically
         market = markets[0]
+        market_spec = get_market_spec(market['market'])
+
         safe_print_func(f"\n[DATA] Auto-detected: {market['market']} (only dataset available)")
         safe_print_func(f"[DATA] Using: {market['minute_file']}")
         if market['has_second']:
             safe_print_func(f"[DATA] Second-level: {market['second_file']}")
-        return market
+
+        if market_spec:
+            safe_print_func(f"[MARKET] {market_spec.name}")
+            safe_print_func(f"[MARKET] Multiplier: ${market_spec.contract_multiplier} | "
+                          f"Tick: {market_spec.tick_size} | "
+                          f"Tick Value: ${market_spec.tick_value:.2f} | "
+                          f"Commission: ${market_spec.commission}")
+
+        return market, market_spec
 
     # Multiple datasets - prompt user
     safe_print_func("\n" + "=" * 80)
@@ -383,7 +395,14 @@ def select_market_for_training(markets, safe_print_func=print):
 
     for i, market in enumerate(markets, 1):
         second_status = "[OK]" if market['has_second'] else "[MINUTE ONLY]"
-        safe_print_func(f"  {i}. {market['market']:<8} - {market['minute_file']:<20} {second_status}")
+        market_spec = get_market_spec(market['market'])
+
+        if market_spec:
+            spec_info = f"(${market_spec.contract_multiplier} x {market_spec.tick_size} tick = ${market_spec.tick_value:.2f})"
+        else:
+            spec_info = "(unknown specs)"
+
+        safe_print_func(f"  {i}. {market['market']:<8} - {market['minute_file']:<20} {second_status:<15} {spec_info}")
 
     safe_print_func("\n" + "=" * 80)
 
@@ -393,25 +412,38 @@ def select_market_for_training(markets, safe_print_func=print):
 
             if choice.lower() == 'q':
                 safe_print_func("\n[INFO] Training cancelled by user")
-                return None
+                return None, None
 
             idx = int(choice) - 1
             if 0 <= idx < len(markets):
                 selected = markets[idx]
+                market_spec = get_market_spec(selected['market'])
+
                 safe_print_func(f"\n[DATA] Selected: {selected['market']}")
                 safe_print_func(f"[DATA] Minute data: {selected['minute_file']}")
                 if selected['has_second']:
                     safe_print_func(f"[DATA] Second data: {selected['second_file']}")
                 else:
                     safe_print_func(f"[DATA] Note: No second-level data available for {selected['market']}")
-                return selected
+
+                if market_spec:
+                    safe_print_func(f"\n[MARKET] {market_spec.name}")
+                    safe_print_func(f"[MARKET] Contract Multiplier: ${market_spec.contract_multiplier}")
+                    safe_print_func(f"[MARKET] Tick Size: {market_spec.tick_size} points")
+                    safe_print_func(f"[MARKET] Tick Value: ${market_spec.tick_value:.2f}")
+                    safe_print_func(f"[MARKET] Default Commission: ${market_spec.commission}/side")
+                    safe_print_func(f"[MARKET] Slippage Model: {market_spec.slippage_ticks} tick(s)")
+                else:
+                    safe_print_func(f"[WARNING] Unknown market specs for {selected['market']}, using ES defaults")
+
+                return selected, market_spec
             else:
                 safe_print_func(f"[ERROR] Invalid choice. Please enter 1-{len(markets)}")
         except ValueError:
             safe_print_func("[ERROR] Invalid input. Please enter a number or 'q'")
         except KeyboardInterrupt:
             safe_print_func("\n[INFO] Training cancelled by user")
-            return None
+            return None, None
 
 
 if __name__ == "__main__":

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Clean 1-second ES futures data for trailing drawdown calculation
+Clean 1-second futures data for trailing drawdown calculation
+
+Market-agnostic cleaning for all futures markets (ES, NQ, YM, RTY, etc.)
 
 Validates and removes:
 - NaN values
 - Duplicates
-- Anomalous prices
+- Anomalous prices (using statistical IQR method)
 - Invalid volumes
 - Corrupted rows
 """
@@ -14,6 +16,24 @@ import pandas as pd
 import numpy as np
 import os
 import sys
+
+# Import centralized validation module
+try:
+    from data_validator import (
+        remove_nan_values as validator_remove_nan,
+        remove_duplicates as validator_remove_duplicates,
+        validate_prices_statistical as validator_validate_prices,
+        detect_price_jumps as validator_detect_jumps
+    )
+except ImportError:
+    # Fallback if running from different directory
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from data_validator import (
+        remove_nan_values as validator_remove_nan,
+        remove_duplicates as validator_remove_duplicates,
+        validate_prices_statistical as validator_validate_prices,
+        detect_price_jumps as validator_detect_jumps
+    )
 
 
 def load_processed_data(file_path):
@@ -30,125 +50,50 @@ def load_processed_data(file_path):
 
 
 def remove_nan_values(df):
-    """Remove rows with NaN values"""
+    """Remove rows with NaN values (using centralized validator)"""
     print(f"\n[2/5] Removing NaN values...")
-
-    rows_before = len(df)
-
-    # Check for NaN in any column
-    df = df.dropna()
-
-    rows_after = len(df)
-    removed = rows_before - rows_after
-
-    print(f"      Before: {rows_before:,} rows")
-    print(f"      After: {rows_after:,} rows")
-    print(f"      Removed: {removed:,} rows ({(removed/rows_before*100):.2f}%)")
-
+    df, stats = validator_remove_nan(df, verbose=False)
+    print(f"      Before: {stats['rows_before']:,} rows")
+    print(f"      After: {stats['rows_after']:,} rows")
+    print(f"      Removed: {stats['nan_rows_removed']:,} rows ({stats['removal_pct']:.2f}%)")
     return df
 
 
 def remove_duplicates(df):
-    """Remove duplicate timestamps"""
+    """Remove duplicate timestamps (using centralized validator)"""
     print(f"\n[3/5] Removing duplicates...")
-
-    rows_before = len(df)
-
-    # Remove duplicate timestamps (keep first)
-    df = df[~df.index.duplicated(keep='first')]
-
-    rows_after = len(df)
-    removed = rows_before - rows_after
-
-    print(f"      Before: {rows_before:,} rows")
-    print(f"      After: {rows_after:,} rows")
-    print(f"      Removed: {removed:,} duplicates ({(removed/rows_before*100):.2f}%)")
-
+    df, stats = validator_remove_duplicates(df, verbose=False)
+    print(f"      Before: {stats['rows_before']:,} rows")
+    print(f"      After: {stats['rows_after']:,} rows")
+    print(f"      Removed: {stats['duplicates_removed']:,} duplicates ({stats['removal_pct']:.2f}%)")
     return df
 
 
 def validate_prices(df):
-    """Validate price values"""
+    """Validate price values using market-agnostic statistical validation (using centralized validator)"""
     print(f"\n[4/5] Validating prices...")
-
-    rows_before = len(df)
-
-    # ES typically trades between 1000-10000
-    min_price = 500
-    max_price = 15000
-
-    # Check OHLC in valid range
-    valid_prices = (
-        (df['open'] >= min_price) & (df['open'] <= max_price) &
-        (df['high'] >= min_price) & (df['high'] <= max_price) &
-        (df['low'] >= min_price) & (df['low'] <= max_price) &
-        (df['close'] >= min_price) & (df['close'] <= max_price)
-    )
-
-    # Check high >= low
-    valid_ohlc = (df['high'] >= df['low'])
-
-    # Check volume is positive
-    valid_volume = (df['volume'] > 0)
-
-    # Combine all checks
-    valid_rows = valid_prices & valid_ohlc & valid_volume
-
-    # Report violations
-    price_violations = (~valid_prices).sum()
-    ohlc_violations = (~valid_ohlc).sum()
-    volume_violations = (~valid_volume).sum()
-
-    if price_violations > 0:
-        print(f"      Price range violations: {price_violations:,}")
-    if ohlc_violations > 0:
-        print(f"      High < Low violations: {ohlc_violations:,}")
-    if volume_violations > 0:
-        print(f"      Invalid volume: {volume_violations:,}")
-
-    df = df[valid_rows].copy()
-
-    rows_after = len(df)
-    removed = rows_before - rows_after
-
-    print(f"      Before: {rows_before:,} rows")
-    print(f"      After: {rows_after:,} rows")
-    print(f"      Removed: {removed:,} rows ({(removed/rows_before*100):.2f}%)")
-
+    df, stats = validator_validate_prices(df, verbose=False)
+    print(f"      Median price: ${stats['median']:,.2f}")
+    print(f"      Valid range: ${stats['min_price']:,.2f} - ${stats['max_price']:,.2f}")
+    if stats['rejected'] > 0:
+        print(f"      Violations detected: {stats['rejected']:,} rows")
+    print(f"      Before: {stats['rows_before']:,} rows")
+    print(f"      After: {stats['rows_after']:,} rows")
+    print(f"      Removed: {stats['rejected']:,} rows ({stats['rejection_pct']:.2f}%)")
     return df
 
 
 def detect_price_jumps(df, threshold_pct=5.0):
-    """Detect anomalous price jumps"""
+    """Detect anomalous price jumps (using centralized validator)"""
     print(f"\n[5/5] Detecting anomalous price jumps (>{threshold_pct}%)...")
-
-    rows_before = len(df)
-
-    # Calculate price changes
-    price_change_pct = np.abs(df['close'].pct_change() * 100)
-
-    # Find jumps exceeding threshold
-    jumps = price_change_pct > threshold_pct
-
-    # Don't remove first row (can't have change)
-    jumps.iloc[0] = False
-
-    n_jumps = jumps.sum()
-
-    if n_jumps > 0:
-        print(f"      Found {n_jumps:,} potential anomalies")
-        print(f"      Max jump: {price_change_pct.max():.2f}%")
-
-        # Remove jumped rows
-        df = df[~jumps].copy()
-
-    rows_after = len(df)
-    removed = rows_before - rows_after
-
-    print(f"      Before: {rows_before:,} rows")
-    print(f"      After: {rows_after:,} rows")
-    print(f"      Removed: {removed:,} rows ({(removed/rows_before*100):.2f}%)")
-
+    df, stats = validator_detect_jumps(df, threshold_pct=threshold_pct, verbose=False)
+    if stats['jumps_found'] > 0:
+        print(f"      Found {stats['jumps_found']:,} potential anomalies")
+        print(f"      Max jump: {stats['max_jump_pct']:.2f}%")
+    print(f"      Before: {stats['rows_before']:,} rows")
+    print(f"      After: {stats['rows_after']:,} rows")
+    removed = stats['rows_before'] - stats['rows_after']
+    print(f"      Removed: {removed:,} rows ({(removed/stats['rows_before']*100):.2f}%)")
     return df
 
 
@@ -176,7 +121,7 @@ def main(input_path=None, output_path=None):
         output_path: Path to output cleaned CSV file (optional)
     """
     print("=" * 80)
-    print("ES FUTURES 1-SECOND DATA CLEANING")
+    print("FUTURES 1-SECOND DATA CLEANING (MARKET-AGNOSTIC)")
     print("=" * 80)
 
     # Default paths (for backward compatibility)
@@ -234,7 +179,7 @@ def main(input_path=None, output_path=None):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='Clean 1-second ES futures data')
+    parser = argparse.ArgumentParser(description='Clean 1-second futures data (market-agnostic)')
     parser.add_argument('--input', type=str, help='Input raw CSV file path')
     parser.add_argument('--output', type=str, help='Output cleaned CSV file path')
     args = parser.parse_args()

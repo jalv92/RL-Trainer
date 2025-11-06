@@ -8,6 +8,71 @@ This document summarizes all the issues that were identified and fixed in the AI
 
 ---
 
+## RL FIX #11: Multi-Market Futures Support
+
+**Date**: November 3, 2025
+
+**Issue**: System was hardcoded for ES (E-mini S&P 500) specifications only. Training on other markets (NQ, YM, RTY, etc.) produced incorrect P&L calculations and reward signals, leading to models that learned invalid trading behaviors.
+
+**Impact**:
+- P&L calculations were off by 2.5× for NQ (should be $20/point, was $50/point)
+- P&L calculations were off by 10× for Micro contracts (MES, MNQ, etc.)
+- Slippage modeling was incorrect for markets with different tick sizes (YM uses 1.0 tick, not 0.25)
+- Impossible to train market-specific models for different futures instruments
+- Agents learned incorrect risk/reward relationships
+
+**Root Cause Analysis**:
+- `environment_phase1.py` lines 82-84: Hardcoded `contract_size = 50`, `slippage_points = 0.25`
+- All P&L calculations across 18+ locations used these hardcoded ES-specific values
+- No mechanism to specify market when creating environments
+
+**Solution**:
+1. Created `src/market_specs.py` with `MarketSpecification` dataclass
+2. Defined presets for all 8 supported markets with correct specifications
+3. Updated Phase 1 and Phase 2 environments to accept `market_spec` parameter
+4. Integrated with existing market detection system for automatic spec loading
+5. Auto-detects market from selected data file (e.g., `NQ_D1M.csv` → NQ specs)
+6. Implemented market-dependent slippage modeling
+
+**Markets Now Supported**:
+- **E-mini**: ES ($50 multiplier), NQ ($20), YM ($5), RTY ($50)
+- **Micro**: MNQ ($2), MES ($5), M2K ($5), MYM ($0.50)
+
+**Market-Dependent Features**:
+- **Slippage Modeling**:
+  - Highly liquid (ES, NQ, MNQ, MES) = 1 tick
+  - Less liquid (YM, RTY, M2K, MYM) = 2 ticks
+- **Default Commissions**:
+  - E-mini contracts = $2.50/side
+  - Micro contracts = $0.60/side
+  - Fully configurable via `commission_override` parameter
+
+**Breaking Change**: Environment constructors now accept optional `market_spec` and `commission_override` parameters. **Defaults to ES specifications for backward compatibility** - existing code continues to work unchanged.
+
+**Benefits**:
+- ✅ **Correct P&L calculations** for all 8 markets
+- ✅ **Market-appropriate slippage modeling** based on liquidity
+- ✅ **Flexible commission configuration** (per-market defaults + override capability)
+- ✅ **Train specialized models** for each futures market
+- ✅ **Apex challenge preparation** for any supported instrument
+- ✅ **Automatic market detection** - no manual configuration needed
+
+**Files Created**:
+- `src/market_specs.py` - Market specification system with all 8 market presets
+
+**Files Modified**:
+- `src/model_utils.py` - Enhanced market selection to display and return market specs
+- `src/environment_phase1.py` - Accept `market_spec` parameter, replace hardcoded values
+- `src/environment_phase2.py` - Pass market specs to parent Phase 1 environment
+- `src/train_phase1.py` - Auto-detect market, apply specs to all environments
+- `src/train_phase2.py` - Auto-detect market, apply specs to all environments
+- `src/evaluate_phase2.py` - Detect market from filename, load appropriate specs
+- `tests/test_environment.py` - Added multi-market test cases
+
+**Testing**: All tests passing. Verified P&L calculations for ES, NQ, and MES produce correct dollar amounts per point movement.
+
+---
+
 ## RL FIX #10: Simplified Action Space (9 → 6 Actions)
 
 **Date**: November 2, 2025

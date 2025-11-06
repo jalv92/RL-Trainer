@@ -12,18 +12,30 @@ Usage:
     python3 evaluate_phase2.py --model models/phase2/best_model.zip
 """
 
+import argparse
+import glob
 import os
 import sys
-import glob
-import argparse
+from typing import Optional
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from sb3_contrib import MaskablePPO  # Phase 2 uses MaskablePPO, not standard PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from environment_phase2 import TradingEnvironmentPhase2
-from apex_compliance_checker import ApexComplianceChecker
-from feature_engineering import add_market_regime_features
+
+from src.apex_compliance_checker import ApexComplianceChecker
+from src.environment_phase2 import TradingEnvironmentPhase2
+from src.feature_engineering import add_market_regime_features
+from src.market_specs import ES_SPEC, get_market_spec
+from src.metadata_utils import read_metadata
+from src.model_utils import (
+    detect_available_markets,
+    detect_models_in_folder,
+    select_market_for_training,
+)
+
+MIN_TIMESTEPS_WARNING = 200_000
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -63,12 +75,31 @@ def safe_print(message=""):
         print(ascii_message)
 
 
-def find_data_file():
-    """Find training data file."""
+def find_data_file(market=None):
+    """Find training data file.
+
+    Args:
+        market: Market identifier (e.g., 'ES', 'NQ') or None for auto-detect
+
+    Returns:
+        Path to data file
+    """
     # Get project root directory (parent of src/)
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(script_dir, 'data')
 
+    # If market specified, prioritize market-specific files
+    if market:
+        market_file = os.path.join(data_dir, f'{market}_D1M.csv')
+        if os.path.exists(market_file):
+            return market_file
+        else:
+            raise FileNotFoundError(
+                f"Market-specific data not found: {market_file}. "
+                f"Please ensure {market}_D1M.csv exists in {data_dir}"
+            )
+
+    # Auto-detect: try standard filenames
     filenames = [
         'D1M.csv',  # 1-minute data
         'ES_D1M.csv',  # Instrument-prefixed 1-minute data
@@ -112,7 +143,8 @@ def load_data(data_path):
 
 def evaluate_phase2_model(
     model_path='models/phase2_position_mgmt_final.zip',
-    vecnorm_path='models/phase2_vecnorm.pkl',
+    vecnorm_path='models/phase2_position_mgmt_final_vecnorm.pkl',
+    market=None,
     max_steps=5000,
     verbose=False
 ):
@@ -122,7 +154,9 @@ def evaluate_phase2_model(
     Args:
         model_path: Path to trained Phase 2 model
         vecnorm_path: Path to VecNormalize stats
+        market: Market identifier (e.g., 'ES', 'NQ') or None for auto-detect
         max_steps: Maximum evaluation steps (prevents infinite loops)
+        verbose: Print detailed evaluation info
 
     Returns:
         Dict of evaluation metrics
@@ -131,14 +165,15 @@ def evaluate_phase2_model(
     safe_print("PHASE 2 MODEL EVALUATION")
     safe_print("=" * 80)
 
-    # Check if model exists
-    if not os.path.exists(model_path):
-        safe_print(f"[ERROR] Model not found: {model_path}")
+    resolved_artifacts = _resolve_model_artifacts(model_path, vecnorm_path, market)
+    if resolved_artifacts is None:
         safe_print("[ERROR] Train Phase 2 first: python3 train_phase2.py")
         return None
 
+    model_path, vecnorm_path = resolved_artifacts
+
     # Load data
-    data_path = find_data_file()
+    data_path = find_data_file(market=market)
     safe_print(f"[DATA] Loading minute-level data from {data_path}")
     data = load_data(data_path)
     safe_print(f"[DATA] Loaded {len(data):,} rows")
@@ -148,35 +183,63 @@ def evaluate_phase2_model(
     data = add_market_regime_features(data)
     safe_print(f"[DATA] Enhanced feature count: {len(data.columns)}")
 
-    # Load second-level data (optional, for real-time drawdown)
-    second_data = None
-    # Get project root directory (parent of src/)
+    # Resolve market symbol and validate
+    detected_symbol = _extract_market_symbol_from_filename(data_path)
+    target_market = market.upper() if market else None
+
+    if target_market and detected_symbol and detected_symbol != target_market:
+        raise RuntimeError(
+            f"Minute data file {os.path.basename(data_path)} belongs to {detected_symbol},"
+            f" but evaluation requested market {target_market}."
+        )
+
+    market_symbol = target_market or detected_symbol
+    market_symbol = _resolve_market_from_metadata(market_symbol, model_path, vecnorm_path)
+    if market_symbol:
+        safe_print(f"[MARKET] Detected market symbol: {market_symbol}")
+    else:
+        safe_print("[MARKET] No explicit market symbol detected; defaulting to ES specs")
+
+    market_spec = get_market_spec(market_symbol) if market_symbol else None
+    if market_spec is None:
+        market_spec = ES_SPEC  # Ultimate fallback
+        safe_print(f"[WARNING] Unknown market symbol; using {market_spec.symbol} specifications")
+
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    second_candidates = [
-        os.path.join(script_dir, 'data', 'D1S.csv'),
-        os.path.join(script_dir, 'data', 'ES_D1S.csv')
-    ]
-    if not any(os.path.exists(path) for path in second_candidates):
-        pattern = os.path.join(script_dir, 'data', '*_D1S.csv')
-        second_candidates.extend(sorted(glob.glob(pattern)))
+    data_dir = os.path.join(script_dir, 'data')
+    second_data_path = _select_second_data_path(data_dir, market_symbol)
 
-    second_data_path = next((path for path in second_candidates if os.path.exists(path)), None)
-
-    if second_data_path and os.path.exists(second_data_path):
+    second_data = None
+    if second_data_path:
         try:
             safe_print(f"[DATA] Loading second-level data from {second_data_path}")
             second_data = pd.read_csv(second_data_path, index_col='ts_event', parse_dates=True)
-            # Ensure timezone is set
             if second_data.index.tz is None:
                 second_data.index = second_data.index.tz_localize('UTC').tz_convert('America/New_York')
             elif str(second_data.index.tz) != 'America/New_York':
                 second_data.index = second_data.index.tz_convert('America/New_York')
             safe_print(f"[DATA] Loaded {len(second_data):,} second-level bars")
+
+            minute_start, minute_end = data.index[0], data.index[-1]
+            second_start, second_end = second_data.index[0], second_data.index[-1]
+            if second_start > minute_start or second_end < minute_end:
+                safe_print(
+                    "[WARN] Second-level data range does not fully cover minute data. "
+                    f"Minute range: {minute_start} → {minute_end}, Second range: {second_start} → {second_end}"
+                )
+
+            if len(second_data) < len(data):
+                safe_print(
+                    f"[WARN] Second-level data count ({len(second_data):,}) is less than minute bars ({len(data):,})."
+                )
         except Exception as e:
             safe_print(f"[DATA] Warning: Could not load second-level data: {e}")
             second_data = None
     else:
-        safe_print("[DATA] Second-level data not found (D1S/ES_D1S/_D1S.csv). Optional feature.")
+        safe_print("[DATA] No market-aligned second-level data located; proceeding without it.")
+
+    safe_print(f"[MARKET] Evaluating with {market_spec.name} specifications")
+    safe_print(f"[MARKET] Multiplier: ${market_spec.contract_multiplier} | Tick: {market_spec.tick_size} | Commission: ${market_spec.commission}")
 
     # Create environment
     safe_print("[ENV] Creating Phase 2 evaluation environment...")
@@ -185,6 +248,7 @@ def evaluate_phase2_model(
         window_size=20,
         initial_balance=50000,
         second_data=second_data,  # Pass second-level data
+        market_spec=market_spec,  # NEW: Pass market spec
         position_size_contracts=1.0,
         trailing_drawdown_limit=2500
     )
@@ -194,6 +258,7 @@ def evaluate_phase2_model(
     if os.path.exists(vecnorm_path):
         env = VecNormalize.load(vecnorm_path, env)
         safe_print(f"[ENV] Loaded VecNormalize from {vecnorm_path}")
+        _verify_artifact_metadata(vecnorm_path, market_symbol, 'VecNormalize stats')
     else:
         env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
         safe_print("[ENV] Using fresh VecNormalize (stats not found)")
@@ -204,6 +269,7 @@ def evaluate_phase2_model(
     # Load model
     safe_print(f"[MODEL] Loading from {model_path}")
     model = MaskablePPO.load(model_path)  # Use MaskablePPO for Phase 2
+    _verify_artifact_metadata(model_path, market_symbol, 'Phase 2 model')
 
     # Evaluation loop
     obs = env.reset()
@@ -255,11 +321,20 @@ def evaluate_phase2_model(
             safe_print(f"  Step {step:,}/{max_steps:,} | Equity: ${equity_curve[-1]:,.2f}")
 
     # Diagnostic: Why did episode end?
+    final_info = info[0] if info else {}
+
     if done and step < max_steps:
         safe_print(f"\n[EVAL] [WARN] Episode ended early at step {step}/{max_steps}")
-        safe_print(f"[EVAL] Final info: {info[0]}")
+        reason = final_info.get('done_reason')
+        if reason:
+            safe_print(f"[EVAL] Done reason: {reason}")
+        safe_print(f"[EVAL] Final info: {final_info}")
 
     safe_print(f"\n[EVAL] [OK] Evaluation complete ({step:,} steps)")
+
+    final_action_mask = final_info.get('action_mask')
+    if final_action_mask is not None:
+        safe_print(f"[EVAL] Final action mask (valid actions): {final_action_mask}")
 
     # Get environment instance for trade history
     env_unwrapped = env.envs[0]
@@ -312,11 +387,19 @@ def evaluate_phase2_model(
         'pm_actions_used': len(pm_actions_taken),
         'pm_usage_pct': pm_usage,
         'equity_curve': equity_curve,
-        'returns': returns.tolist()
+        'returns': returns.tolist(),
+        'done_reason': final_info.get('done_reason'),
+        'observation_quality': final_info.get('observation_quality'),
     }
     
     # Add comprehensive metrics
     results.update(comprehensive_metrics)
+
+    obs_quality = results.get('observation_quality') or {}
+    if obs_quality.get('has_nan') or obs_quality.get('has_inf'):
+        safe_print(
+            "[WARN] Observation quality issues detected (NaN or Inf present in final step observations)."
+        )
 
     # Print results
     safe_print("\n" + "=" * 80)
@@ -345,6 +428,13 @@ def evaluate_phase2_model(
         pm_breakdown = dict(zip(*np.unique(pm_actions_taken, return_counts=True)))
         for pm_action, count in sorted(pm_breakdown.items(), key=lambda x: -x[1]):
             safe_print(f"    {pm_action}: {count}")
+
+    safe_print()
+    safe_print(f"[MARKET EVALUATED]")
+    safe_print(f"  Symbol: {market_spec.symbol} ({market_spec.name})")
+    safe_print(f"  Contract Multiplier: ${market_spec.contract_multiplier}")
+    safe_print(f"  Tick Size: {market_spec.tick_size}")
+    safe_print(f"  Commission: ${market_spec.commission}/side")
 
     # Save plots
     safe_print(f"\n[PLOT] Generating evaluation charts...")
@@ -544,7 +634,9 @@ def save_metrics_json(results):
         'max_drawdown_pct': float(results['max_drawdown_pct']),
         'pm_actions_used': results['pm_actions_used'],
         'pm_usage_pct': float(results['pm_usage_pct']),
-        'action_distribution': {int(k): int(v) for k, v in results['action_distribution'].items()}
+        'action_distribution': {int(k): int(v) for k, v in results['action_distribution'].items()},
+        'done_reason': results.get('done_reason'),
+        'observation_quality': results.get('observation_quality'),
     }
 
     metrics_path = 'results/phase2_metrics.json'
@@ -559,18 +651,51 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate Phase 2 Model')
     parser.add_argument('--model', default='models/phase2_position_mgmt_final.zip',
                        help='Path to model')
-    parser.add_argument('--vecnorm', default='models/phase2_vecnorm.pkl',
+    parser.add_argument('--vecnorm', default='models/phase2_position_mgmt_final_vecnorm.pkl',
                        help='Path to VecNormalize stats')
     parser.add_argument('--max-steps', type=int, default=5000,
                        help='Maximum evaluation steps')
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose logging (first 10 steps)')
+    parser.add_argument('--market', type=str, default=None,
+                       help='Market to evaluate (ES, NQ, YM, RTY, MNQ, MES, M2K, MYM). If not specified, will auto-detect from data file.')
+    parser.add_argument('--non-interactive', action='store_true',
+                       help='Run in non-interactive mode (no prompts, use defaults)')
 
     args = parser.parse_args()
+
+    # Detect and select market
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dir = os.path.join(script_dir, 'data')
+    available_markets = detect_available_markets(data_dir)
+
+    # If market override provided via CLI, use it directly
+    if args.market:
+        from src.market_specs import get_market_spec
+        market_spec = get_market_spec(args.market.upper())
+        if market_spec is None:
+            safe_print(f"\n[ERROR] Invalid market symbol: {args.market}")
+            safe_print("[ERROR] Valid markets: ES, NQ, YM, RTY, MNQ, MES, M2K, MYM")
+            return
+        market_name = args.market.upper()
+        safe_print(f"\n[CLI] Market specified via --market: {market_name}")
+    else:
+        if not args.non_interactive and available_markets and len(available_markets) > 1:
+            # Interactive market selection
+            selected_market, market_spec_selected = select_market_for_training(available_markets, safe_print)
+            if selected_market is None:
+                safe_print("\n[INFO] Evaluation cancelled - no market selected")
+                return
+            market_name = selected_market['market']
+        else:
+            # Auto-detect from data file (current behavior)
+            market_name = None
+            safe_print("\n[INFO] Market will be auto-detected from data file")
 
     results = evaluate_phase2_model(
         model_path=args.model,
         vecnorm_path=args.vecnorm,
+        market=market_name,
         max_steps=args.max_steps,
         verbose=args.verbose
     )
@@ -581,6 +706,174 @@ def main():
         safe_print("[OUTPUT] Metrics: results/phase2_metrics.json")
     else:
         safe_print("\n[FAILED] Evaluation failed")
+
+
+def _extract_market_symbol_from_filename(filename: str) -> Optional[str]:
+    base = os.path.basename(filename)
+    base_upper = base.upper()
+    suffix = '_D1M.CSV'
+    if base_upper.endswith(suffix):
+        symbol = base_upper[:-len(suffix)]
+        return symbol if symbol else None
+    return None
+
+
+def _select_second_data_path(data_dir: str, market_symbol: Optional[str]) -> Optional[str]:
+    """Resolve the correct second-level data file for the market."""
+    candidates = []
+    if market_symbol:
+        targeted = os.path.join(data_dir, f"{market_symbol}_D1S.csv")
+        if os.path.exists(targeted):
+            return targeted
+        candidates = sorted(glob.glob(os.path.join(data_dir, f"{market_symbol}*_D1S.csv")))
+        if candidates:
+            return candidates[0]
+
+    generic_path = os.path.join(data_dir, 'D1S.csv')
+    if market_symbol is None and os.path.exists(generic_path):
+        return generic_path
+
+    specific_files = sorted(glob.glob(os.path.join(data_dir, '*_D1S.csv')))
+    if len(specific_files) == 1 and market_symbol is None:
+        return specific_files[0]
+
+    return None
+
+
+def _resolve_market_from_metadata(
+    initial_symbol: Optional[str], model_path: str, vecnorm_path: str
+) -> Optional[str]:
+    """Use artifact metadata to refine the market symbol if available."""
+    candidate_symbols = []
+    for path in (model_path, vecnorm_path):
+        if not path or not os.path.exists(path):
+            continue
+        meta = read_metadata(path)
+        if meta:
+            meta_symbol = meta.get('market')
+            if meta_symbol:
+                candidate_symbols.append(meta_symbol.upper())
+
+    if not candidate_symbols:
+        return initial_symbol
+
+    unique_symbols = sorted(set(candidate_symbols))
+
+    if initial_symbol:
+        desired = initial_symbol.upper()
+        if any(symbol != desired for symbol in unique_symbols):
+            raise RuntimeError(
+                "Artifact metadata markets do not match requested market: "
+                f"{unique_symbols} vs {desired}."
+            )
+        return initial_symbol
+
+    if len(unique_symbols) == 1:
+        resolved = unique_symbols[0]
+        safe_print(f"[MARKET] Using market '{resolved}' from artifact metadata")
+        return resolved
+
+    raise RuntimeError(
+        "Conflicting market metadata across artifacts: " + ', '.join(unique_symbols)
+    )
+
+
+def _verify_artifact_metadata(path: str, market_symbol: Optional[str], artifact_label: str):
+    metadata = read_metadata(path)
+    if not metadata:
+        safe_print(f"[WARN] {artifact_label} metadata not found for {path}.")
+        return None
+
+    meta_market = metadata.get('market')
+    if market_symbol and meta_market and meta_market.upper() != market_symbol.upper():
+        raise RuntimeError(
+            f"{artifact_label} market mismatch: expected {market_symbol}, found {meta_market}."
+        )
+
+    if metadata.get('test_mode'):
+        raise RuntimeError(
+            f"{artifact_label} metadata indicates test mode training; retrain with production timesteps."
+        )
+
+    total_timesteps = metadata.get('total_timesteps')
+    if isinstance(total_timesteps, (int, float)) and total_timesteps < MIN_TIMESTEPS_WARNING:
+        safe_print(
+            f"[WARN] {artifact_label} trained for only {int(total_timesteps):,} timesteps. "
+            f"Expected full production training before evaluation."
+        )
+
+    return metadata
+
+
+def _resolve_model_artifacts(
+    model_path: str,
+    vecnorm_path: str,
+    requested_market: Optional[str]
+) -> Optional[tuple[str, str]]:
+    """Ensure model/VecNormalize paths exist, falling back to newest artifacts if needed."""
+
+    model_exists = os.path.exists(model_path)
+    vecnorm_exists = os.path.exists(vecnorm_path)
+
+    if model_exists and vecnorm_exists:
+        return model_path, vecnorm_path
+
+    safe_print(f"[WARN] Requested artifacts missing: model={model_exists}, vecnorm={vecnorm_exists}")
+    candidates = detect_models_in_folder(phase='phase2')
+
+    if not candidates:
+        safe_print("[ERROR] No Phase 2 models found in models/ directory.")
+        return None
+
+    requested_upper = requested_market.upper() if requested_market else None
+
+    def candidate_score(entry):
+        meta = read_metadata(entry['path'])
+        market = (meta or {}).get('market')
+        test_mode = bool((meta or {}).get('test_mode'))
+
+        market_match = 1 if requested_upper and market and market.upper() == requested_upper else 0
+        unspecified_ok = 1 if not requested_upper else 0
+        penalty = -1 if test_mode else 0
+
+        # Prefer exact market match, then non-test, then newest (already sorted by detect_models_in_folder)
+        return (market_match, unspecified_ok, penalty)
+
+    sorted_candidates = sorted(candidates, key=candidate_score, reverse=True)
+
+    for entry in sorted_candidates:
+        candidate_model = entry['path']
+        candidate_vec = entry.get('vecnorm_path')
+
+        meta = read_metadata(candidate_model)
+        if requested_upper and meta and meta.get('market') and meta['market'].upper() != requested_upper:
+            continue
+
+        if not os.path.exists(candidate_model):
+            continue
+
+        if candidate_vec and not os.path.exists(candidate_vec):
+            candidate_vec = None
+
+        if candidate_vec is None:
+            guessed_vec = os.path.splitext(candidate_model)[0] + '_vecnorm.pkl'
+            if os.path.exists(guessed_vec):
+                candidate_vec = guessed_vec
+
+        if candidate_vec is None:
+            safe_print(f"[WARN] VecNormalize stats missing for candidate model {candidate_model}")
+            continue
+
+        safe_print(f"[INFO] Using auto-detected model: {os.path.basename(candidate_model)}")
+        if meta:
+            safe_print(
+                f"[INFO] Model metadata → market={meta.get('market')}, timesteps={meta.get('total_timesteps')}, test_mode={meta.get('test_mode')}"
+            )
+
+        return candidate_model, candidate_vec
+
+    safe_print("[ERROR] Could not locate Phase 2 model/VecNormalize pair matching requested criteria.")
+    return None
 
 
 if __name__ == '__main__':
