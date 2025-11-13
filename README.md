@@ -6,17 +6,22 @@ A comprehensive reinforcement learning trading system with an interactive comman
 
 ## Overview
 
-This project implements a two-phase curriculum learning approach for training trading agents that comply with Apex Trader Funding rules. The system uses PPO (Proximal Policy Optimization) algorithm with transfer learning to develop robust trading strategies.
+This project implements a **three-phase curriculum learning approach** for training trading agents that comply with Apex Trader Funding rules. The system uses PPO (Proximal Policy Optimization) algorithm with transfer learning and optional LLM integration to develop robust trading strategies.
 
 ## Features
 
 - **Interactive CLI Menu System** - Easy-to-use interface for all operations
-- **Two-Phase Training Pipeline** - Curriculum learning approach
+- **Three-Phase Training Pipeline** - Progressive curriculum learning
   - Phase 1: Entry signal quality learning (fixed SL/TP)
-  - Phase 2: Position management with dynamic SL/TP
+  - Phase 2: Position management with dynamic SL/TP and action masking
+  - Phase 3: Hybrid RL + LLM agent with context-aware reasoning
 - **Continue Training from Checkpoint** - Resume training from any saved model
 - **Smart Model Detection** - Automatically finds and loads the newest models
-- **Data Processing** - Support for 8 major futures instruments
+- **Automatic Data Corruption Detection** - Detects and fixes divide-by-100 errors
+- **Multi-Market Support** - 8 major futures instruments with automatic contract specs
+- **Action Masking** - Prevents invalid actions in Phase 2 & 3
+- **Comprehensive Testing Framework** - Hardware-maximized and pipeline testing modes
+- **Thread Pool Management** - Stable training on constrained systems
 - **Model Evaluation** - Comprehensive performance metrics
 - **Compliance Enforcement** - 100% Apex Trader Funding rules compliance
 - **Progress Tracking** - Colored output and detailed logging
@@ -43,62 +48,110 @@ AI Trainer/
 ├── requirements.txt             # Python dependencies
 ├── setup.py                     # TensorTrade package setup
 │
-├── src/                         # Core source code
-│   ├── __init__.py
-│   ├── environment_phase1.py    # Phase 1 trading environment
-│   ├── environment_phase2.py    # Phase 2 trading environment
-│   ├── feature_engineering.py   # Feature extraction
-│   ├── technical_indicators.py  # Technical indicators
-│   ├── kl_callback.py           # KL divergence monitoring
-│   ├── model_utils.py           # Model detection and loading utilities
-│   ├── market_specs.py          # Market specifications (8 futures markets)
-│   ├── train_phase1.py          # Phase 1 training script
-│   ├── train_phase2.py          # Phase 2 training script
-│   ├── evaluate_phase2.py       # Model evaluation
-│   ├── data_validator.py        # ⭐ NEW: Centralized data validation
-│   ├── process_new_data.py      # ⭐ NEW: Process new data (auto corruption fix)
-│   ├── reprocess_from_source.py # ⭐ NEW: Reprocess old corrupted data
-│   ├── update_training_data.py  # Data processing script
-│   ├── clean_second_data.py     # Second-level data cleaning
-│   └── process_second_data.py   # Second-level data processing
+├── config/                      # Configuration files
+│   ├── llm_config.yaml          # Phase 3 LLM configuration
+│   ├── test_hardware_maximized.yaml  # Hardware testing config
+│   └── test_pipeline.yaml       # Pipeline testing config
+│
+├── src/                         # Core source code (30 files)
+│   ├── Training & Environments
+│   │   ├── train_phase1.py         # Phase 1 training (2M timesteps)
+│   │   ├── train_phase2.py         # Phase 2 training (5M timesteps)
+│   │   ├── train_phase3_llm.py     # Phase 3 hybrid training
+│   │   ├── environment_phase1.py   # Base trading environment
+│   │   ├── environment_phase2.py   # Position management environment
+│   │   ├── environment_phase3_llm.py  # LLM-enhanced environment
+│   │   └── environment_phase1_simplified.py  # Simplified reward function
+│   │
+│   ├── Evaluation
+│   │   ├── evaluate_phase2.py      # Phase 2 evaluation
+│   │   └── evaluate_phase3_llm.py  # Phase 3 evaluation
+│   │
+│   ├── Data Processing
+│   │   ├── update_training_data.py      # Main data pipeline (auto corruption fix)
+│   │   ├── process_new_data.py          # Fast processing with corruption detection
+│   │   ├── reprocess_from_source.py     # Reprocess corrupted data
+│   │   ├── clean_second_data.py         # Second-level data cleaning
+│   │   ├── process_second_data.py       # Second-level data processing
+│   │   ├── data_validator.py            # Centralized validation functions
+│   │   └── validate_data_quality.py     # Data quality validation
+│   │
+│   ├── Feature Engineering
+│   │   ├── feature_engineering.py       # Market regime features
+│   │   ├── technical_indicators.py      # 11+ technical indicators
+│   │   └── llm_features.py              # Extended LLM features
+│   │
+│   ├── Trading Logic & Compliance
+│   │   ├── market_specs.py              # Market specifications (8 futures)
+│   │   ├── apex_compliance_checker.py   # Post-training compliance validation
+│   │   └── metadata_utils.py            # Model metadata management
+│   │
+│   ├── RL & LLM Integration
+│   │   ├── hybrid_agent.py              # Decision fusion module
+│   │   ├── llm_reasoning.py             # LLM reasoning module
+│   │   ├── llm_callback.py              # LLM training callbacks
+│   │   ├── kl_callback.py               # KL divergence monitoring
+│   │   └── model_utils.py               # Model detection and loading utilities
+│   │
+│   └── Utilities
+│       ├── testing_framework.py         # Optimized testing framework
+│       └── diagnose_environment.py      # Environment diagnostics
 │
 ├── data/                        # Training data (CSV files)
+│   ├── NQ_D1M.csv              # Example: NQ minute data
+│   ├── NQ_D1S.csv              # Example: NQ second data
 │   └── .gitkeep
 │
 ├── models/                      # Saved model checkpoints
-│   └── .gitkeep
-│
-├── logs/                        # Training and execution logs
+│   ├── phase1_foundational_final.zip
+│   ├── phase2_position_mgmt_final.zip
+│   ├── phase3_hybrid_final.zip
 │   └── .gitkeep
 │
 ├── results/                     # Evaluation results
 │   └── .gitkeep
 │
-├── tensorboard_logs/            # TensorBoard logs
+├── logs/                        # Training and execution logs
+│   └── .gitkeep
+│
+├── tensorboard_logs/            # TensorBoard monitoring
 │   └── .gitkeep
 │
 ├── img/                         # Screenshots and images
-│   └── .gitkeep
+│   ├── Screenshot_105.png       # Main menu
+│   ├── Screenshot_106.png       # Data processing
+│   └── Screenshot_107.png       # Evaluator
 │
-├── tests/                       # Test suite
-│   ├── __init__.py
+├── tests/                       # Test suite (8 files)
+│   ├── test_setup.py            # Installation verification
 │   ├── test_environment.py      # Environment tests
-│   └── test_integration.py      # Integration tests
+│   ├── test_integration.py      # Integration tests
+│   ├── test_market_selection.py # Market selection tests
+│   ├── test_action_masking.py   # Action masking tests
+│   ├── test_llm_minimal.py      # Minimal LLM tests
+│   ├── test_llm_integration.py  # Full LLM integration tests
+│   └── __init__.py
 │
-├── docs/                        # Documentation
+├── docs/                        # Comprehensive documentation
 │   ├── Apex-Rules.md            # Apex Trader Funding compliance rules
-│   ├── QUICK_START_DATA_PROCESSING.md  # ⭐ NEW: Quick start data guide
-│   └── DATA_REPROCESSING_GUIDE.md      # ⭐ NEW: Detailed reprocessing guide
+│   ├── QUICK_START_DATA_PROCESSING.md  # Quick start data guide
+│   ├── HYBRID_ARCHITECTURE.md   # Phase 3 architecture
+│   ├── LLM_INTEGRATION_GUIDE.md # LLM setup and customization
+│   ├── TESTING_FRAMEWORK_README.md     # Testing framework guide
+│   ├── FIXES_SUMMARY.md         # Recent fixes and improvements
+│   └── ...
 │
-└── tensortrade/                 # TensorTrade package source
-    └── (complete package)
+└── scripts/                     # Utility scripts
+    ├── run_pipeline.py          # Automated pipeline execution
+    ├── benchmark_optimizations.py  # Performance benchmarking
+    └── validate_testing_framework.py  # Test validation
 ```
 
 ## Installation
 
 ### Prerequisites
 
-- Python 3.11.9 or higher
+- Python 3.11.9 or higher (Python 3.13 supported)
 - pip (Python package manager)
 - (Optional) CUDA-compatible GPU for faster training
 
@@ -137,7 +190,7 @@ The interactive menu provides 5 main options:
 
 1. **Requirements Installation** - Install all dependencies
 2. **Data Processing** - Process market data for training
-3. **Training Model** - Train Phase 1 and Phase 2 models
+3. **Training Model** - Train Phase 1, 2, and 3 models
    - Training Test (Local Testing)
    - Training Pod (Production)
    - **Continue from Existing Model** ⭐ NEW
@@ -217,6 +270,9 @@ python src/train_phase1.py
 
 # Phase 2: Position Management (5M timesteps with transfer learning)
 python src/train_phase2.py
+
+# Phase 3: Hybrid RL + LLM Agent (5M timesteps)
+python src/train_phase3_llm.py
 ```
 
 For quick testing (reduced dataset):
@@ -224,12 +280,17 @@ For quick testing (reduced dataset):
 ```bash
 python src/train_phase1.py --test
 python src/train_phase2.py --test
+python src/train_phase3_llm.py --test
 ```
 
 #### 3. Evaluate Model
 
 ```bash
+# Phase 2 evaluation
 python src/evaluate_phase2.py
+
+# Phase 3 evaluation
+python src/evaluate_phase3_llm.py --model models/phase3_hybrid_final --market NQ
 ```
 
 #### 4. View Training Progress
@@ -304,13 +365,14 @@ PHASE1_CONFIG = {
 
 ## System Architecture
 
-### Two-Phase Curriculum Learning
+### Three-Phase Curriculum Learning
 
 ```
 Phase 1: Entry Signal Learning
   ├─ Fixed SL/TP (1.5x ATR SL, 3:1 ratio)
   ├─ 3 actions: Hold, Buy, Sell
   ├─ Focus: Entry signal quality
+  ├─ Constraints: Relaxed for learning ($15K trailing DD)
   └─ Duration: 2M timesteps (~6-8 hours on RTX 4000)
 
 Phase 2: Position Management (Transfer Learning)
@@ -319,7 +381,16 @@ Phase 2: Position Management (Transfer Learning)
   ├─ Dynamic SL/TP adjustment
   ├─ 6 actions: Streamlined position management
   ├─ Focus: Risk management
+  ├─ Constraints: Strict Apex compliance ($2.5K trailing DD)
   └─ Duration: 5M timesteps (~8-10 hours)
+
+Phase 3: Hybrid RL + LLM Agent
+  ├─ Action Space: 6 actions (same as Phase 2)
+  ├─ LLM: Phi-3-mini (3.8B params, INT8 quantized)
+  ├─ Decision Fusion: Confidence-weighted voting
+  ├─ Observation Space: 261D (extended context)
+  ├─ Hardware: GPU with 8GB+ VRAM
+  └─ Duration: 5M timesteps (~12-16 hours)
 ```
 
 ### Multi-Layer Safety System
@@ -335,13 +406,32 @@ Layer 3: Validation Level (Verification)
   └─ Post-training compliance checks
 ```
 
+### Thread Pool Management
+
+The system includes automatic thread pool management to prevent OpenBLAS pthread creation failures:
+
+```python
+# Automatic BLAS thread limiting
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+
+# Automatic environment count alignment with CPU cores
+# Override with: TRAINER_NUM_ENVS=40
+```
+
+**Benefits:**
+- Stable training on constrained systems
+- Prevents "pthread_create failed" errors
+- Automatic CPU core detection and optimization
+- Configurable overrides for advanced users
+
 ## Apex Trader Funding Compliance
 
 The system enforces 100% compliance with Apex rules:
 
 - 4:59 PM ET mandatory position close
 - $2,500 max trailing drawdown limit
-- $1,000 daily loss limit
 - No overnight positions
 - Position size constraints
 - Trade frequency limits
@@ -354,10 +444,25 @@ See `docs/Apex-Rules.md` for complete compliance details.
 
 ```python
 PHASE1_CONFIG = {
+    # Training
     'total_timesteps': 2_000_000,
-    'num_envs': 80,
+    'num_envs': 80,  # Auto-adjusted based on CPU cores
+    
+    # Network
+    'policy_layers': [512, 256, 128],
+    
+    # PPO parameters
     'learning_rate': 3e-4,
+    'n_steps': 2048,
     'batch_size': 512,
+    'n_epochs': 10,
+    'gamma': 0.99,
+    'gae_lambda': 0.95,
+    'clip_range': 0.2,
+    'ent_coef': 0.01,
+    'vf_coef': 0.5,
+    
+    # Device
     'device': 'cuda'  # or 'cpu'
 }
 ```
@@ -366,10 +471,26 @@ PHASE1_CONFIG = {
 
 ```python
 PHASE2_CONFIG = {
+    # Training
     'total_timesteps': 5_000_000,
-    'num_envs': 80,
+    'num_envs': 80,  # Auto-adjusted based on CPU cores
+    
+    # Network (reduced capacity to prevent overfitting)
+    'policy_layers': [512, 256, 128],
+    
+    # PPO parameters
     'learning_rate': 3e-4,
+    'n_steps': 2048,
     'batch_size': 512,
+    'n_epochs': 10,
+    'gamma': 0.99,
+    'gae_lambda': 0.95,
+    'clip_range': 0.2,
+    'ent_coef': 0.01,
+    'vf_coef': 0.5,
+    'target_kl': 0.01,
+    
+    # Device
     'device': 'cuda'  # or 'cpu'
 }
 ```
@@ -380,7 +501,122 @@ PHASE2_CONFIG = {
 - Action 4: Enable Trailing Stop
 - Action 5: Disable Trailing Stop
 
-*Note: Simplified from original 9 actions for improved learning efficiency*
+*Note: Simplified from original 9 actions for improved sample efficiency and reduced overfitting*
+
+### Phase 3: Hybrid RL + LLM Agent (Advanced)
+
+**NEW** - Combines reinforcement learning with LLM reasoning for intelligent trading decisions.
+
+```bash
+# Phase 3: Hybrid LLM Agent (requires GPU with 8GB+ VRAM)
+python main.py
+# Select: Training → Phase 3 Hybrid (Test Mode)  # ~30 min test run
+# Select: Training → Phase 3 Hybrid (Production)  # ~12-16 hours
+```
+
+**Phase 3 Features:**
+- **Context Awareness**: 261D observations (vs 228D in Phase 2)
+  - Extended market context (ADX slope, VWAP distance, volatility regime)
+  - Multi-timeframe indicators (SMA-50/200 slopes, multi-timeframe RSI)
+  - Pattern recognition (higher/lower highs/lows, support/resistance)
+  - Risk context (unrealized P&L, drawdown tracking, consecutive losses)
+- **LLM Reasoning**: Phi-3-mini provides explicit analysis before decisions
+- **Decision Fusion**: Intelligent combination of RL + LLM recommendations
+- **Risk Management**: Automatic veto of high-risk actions
+- **Selective Querying**: Queries LLM only when needed (reduces latency)
+
+**Hardware Requirements:**
+- GPU: RTX 3060 or better (8GB+ VRAM recommended)
+- RAM: 16GB minimum, 32GB recommended
+- Storage: 10GB additional space
+
+**Key Files:**
+- `src/train_phase3_llm.py` - Training pipeline
+- `src/hybrid_agent.py` - Decision fusion logic
+- `src/llm_reasoning.py` - LLM reasoning module
+- `src/llm_features.py` - Extended feature calculation
+- `config/llm_config.yaml` - LLM configuration
+- `docs/HYBRID_ARCHITECTURE.md` - Complete architecture documentation
+
+**Quick Start:**
+```bash
+# Install LLM dependencies
+pip install transformers torch accelerate bitsandbytes sentencepiece
+
+# Run test training
+python main.py
+# Select: Training → Phase 3 Hybrid (Test Mode)
+```
+
+**Configuration:**
+Edit `config/llm_config.yaml` to customize:
+- LLM model selection (Phi-3-mini, Phi-3-small, etc.)
+- Decision fusion parameters (LLM weight: 0.0-1.0, confidence thresholds)
+- Prompt templates for different market conditions
+- Risk veto thresholds
+- Performance optimization settings
+
+**Performance:**
+- Test mode: ~30 minutes (50K timesteps)
+- Production: ~12-16 hours (5M timesteps)
+- LLM inference: ~15-20ms per query (RTX 3060)
+- VRAM usage: ~4GB with INT8 quantization
+
+**Evaluation:**
+```bash
+python src/evaluate_phase3_llm.py \
+    --model models/phase3_hybrid_final \
+    --market NQ \
+    --episodes 20
+```
+
+**Documentation:**
+- [Hybrid Architecture Guide](docs/HYBRID_ARCHITECTURE.md) - Complete system overview
+- [LLM Integration Guide](docs/LLM_INTEGRATION_GUIDE.md) - Setup and customization
+
+## Testing Framework
+
+The system includes an **optimized testing framework** with two modes:
+
+### 1. Hardware-Maximized Validation Mode
+- Full GPU utilization with reduced timesteps
+- Cached LLM feature calculations
+- Vectorized decision fusion
+- Performance benchmarking
+
+```bash
+python src/testing_framework.py --mode hardware_maximized --market NQ
+```
+
+### 2. Automated Sequential Pipeline Mode
+- Continuous execution with checkpointing
+- Automated validation
+- Progress tracking
+
+```bash
+python src/testing_framework.py --mode pipeline --market NQ
+```
+
+### Run Standard Tests
+
+```bash
+# Run all tests
+python -m pytest tests/ -v
+
+# Run specific tests
+python -m pytest tests/test_environment.py -v
+python -m pytest tests/test_integration.py -v
+python -m pytest tests/test_llm_integration.py -v
+python -m pytest tests/test_action_masking.py -v
+```
+
+**Test Coverage:**
+- Environment validation
+- Action masking correctness
+- Integration workflows
+- LLM integration
+- Market selection
+- Apex compliance
 
 ## Data Format
 
@@ -400,23 +636,20 @@ Data files should be placed in `data/` directory with naming convention:
 - `{INSTRUMENT}_D1M.csv` (minute data)
 - `{INSTRUMENT}_D1S.csv` (second data)
 
-## Testing
-
-Run the test suite:
+### Data Processing Pipeline
 
 ```bash
-python -m pytest tests/ -v
+# Process new data (auto-corruption detection)
+python src/process_new_data.py --market NQ
+
+# Reprocess old corrupted data
+python src/reprocess_from_source.py --market NQ
+
+# Validate data quality
+python src/validate_data_quality.py --market NQ
 ```
 
-Run specific tests:
-
-```bash
-# Environment tests
-python -m pytest tests/test_environment.py -v
-
-# Integration tests
-python -m pytest tests/test_integration.py -v
-```
+**Corruption Detection:** Automatically detects and fixes divide-by-100 errors using statistical analysis and percentile-based validation.
 
 ## Troubleshooting
 
@@ -441,6 +674,7 @@ Or use CPU:
 - Reduce learning rate: `3e-4` → `1e-4`
 - Increase clip range: `0.2` → `0.3`
 - Check reward scaling
+- Enable KL divergence monitoring
 
 ### Import Errors
 
@@ -450,12 +684,34 @@ Ensure TensorTrade is installed:
 python setup.py install
 ```
 
-### Model Not Found
+### Model Not Found (Phase 2)
 
-If Phase 2 can't find Phase 1 model:
-- The system now auto-detects the newest Phase 1 model
-- Ensure you've completed Phase 1 training
-- Check `models/` directory for Phase 1 models
+The system auto-detects the newest Phase 1 model. Ensure:
+- Phase 1 training completed
+- Model exists in `models/` directory
+- Model filename contains "phase1"
+
+### Thread Pool Errors (OpenBLAS)
+
+The system automatically limits thread pools. If you encounter issues:
+
+```bash
+# Explicitly set thread limits
+set TRAINER_MAX_BLAS_THREADS=1
+set TRAINER_NUM_ENVS=40
+
+# Or use environment variables
+export TRAINER_MAX_BLAS_THREADS=1
+export TRAINER_NUM_ENVS=40
+```
+
+### Data Corruption
+
+Run reprocessing:
+
+```bash
+python src/reprocess_from_source.py --market NQ
+```
 
 ## Performance Metrics
 
@@ -468,6 +724,7 @@ Target metrics for successful training:
 | Win Rate | > 50% | Target |
 | Max Drawdown | < 5% | Enforced |
 | GPU Utilization | 85%+ | Optimized |
+| LLM Query Latency | < 20ms | Phase 3 |
 
 ## Logs and Outputs
 
@@ -475,17 +732,19 @@ Target metrics for successful training:
 - **TensorBoard logs**: `tensorboard_logs/`
 - **Model checkpoints**: `models/`
 - **Evaluation results**: `results/`
+- **Testing logs**: `logs/testing/`
 
 ## Tips
 
 - All operations are logged for debugging
 - Press Ctrl+C to cancel any operation
 - Check logs directory for detailed output
-- Ensure sufficient disk space (>10GB for full training)
+- Ensure sufficient disk space (>20GB for full training)
 - Use test mode (`--test` flag) for quick validation
 - Monitor GPU/CPU usage during training
 - Use "Continue Training" to resume interrupted sessions
 - Phase 2 automatically finds your newest Phase 1 model
+- Run tests before committing changes: `pytest tests/ -v`
 
 ## Common Workflows
 
@@ -495,14 +754,15 @@ Target metrics for successful training:
 python main.py
 # Select 1: Requirements Installation
 # Select 2: Data Processing (choose instrument)
+# Wait for completion
 ```
 
-### 2. Complete Training Pipeline
+### 2. Complete Training Pipeline (Production)
 
 ```bash
 python main.py
 # Select 3: Training Model → 2: Training Pod (Production)
-# Wait for completion (~14-18 hours total)
+# Wait for completion (~26-34 hours total)
 # Select 4: Evaluator
 ```
 
@@ -511,11 +771,11 @@ python main.py
 ```bash
 python main.py
 # Select 3: Training Model → 1: Training Test (Local)
-# Wait for completion (~30-60 minutes)
+# Wait for completion (~30-45 minutes)
 # Select 4: Evaluator
 ```
 
-### 4. Resume Training (NEW)
+### 4. Resume Training from Checkpoint
 
 ```bash
 python main.py
@@ -525,16 +785,45 @@ python main.py
 # Training continues from checkpoint
 ```
 
+### 5. Data Processing Workflow
+
+```bash
+# Download new data from Databento
+# Process with automatic corruption detection
+python src/process_new_data.py --market NQ
+
+# Validate data quality
+python src/validate_data_quality.py --market NQ
+
+# Start training
+python src/train_phase1.py --market NQ
+```
+
+### 6. Testing Workflow
+
+```bash
+# Run hardware-maximized test
+python src/testing_framework.py --mode hardware_maximized --market NQ
+
+# Run pipeline test
+python src/testing_framework.py --mode pipeline --market NQ
+
+# Run unit tests
+python -m pytest tests/ -v
+```
+
 ## Technology Stack
 
 - **RL Framework**: Stable Baselines3 (PPO algorithm)
 - **Action Masking**: sb3-contrib (MaskablePPO)
 - **Environment**: Gymnasium API
-- **Trading Library**: TensorTrade
-- **Deep Learning**: PyTorch 2.0+
-- **Data Processing**: Pandas, NumPy
+- **Deep Learning**: PyTorch 2.0+, TensorFlow 2.15+
+- **LLM Integration**: Hugging Face Transformers (Phi-3-mini)
+- **Quantization**: bitsandbytes (INT8/INT4)
+- **Data Processing**: Pandas, NumPy, SciPy, Scikit-Learn
 - **Visualization**: Matplotlib, Plotly, TensorBoard
 - **UI**: Colorama, tqdm, rich
+- **Testing**: pytest
 
 ## License
 
@@ -546,47 +835,36 @@ Apache License 2.0 (inherited from TensorTrade)
 2. Follow existing code style
 3. Update documentation for new features
 4. Ensure Apex compliance for any trading logic changes
+5. Update CHANGELOG.md with changes
 
 ## Support & Contact
 
-For questions, suggestions, or discussions:
-
+**Author**: Javier  
 **X (Twitter)**: [@javiertradess](https://x.com/javiertradess)
 
 For technical issues:
 1. Check logs in `logs/` directory
 2. Review `docs/Apex-Rules.md` for compliance questions
 3. Run tests to diagnose issues: `pytest tests/ -v`
+4. Review `docs/FIXES_SUMMARY.md` for recent bug fixes
 
 ## Version
 
-**RL TRAINER v1.0.0** - October 2025
+**RL TRAINER v1.1.0** - November 2025  
 Based on TensorTrade v1.0.4-dev1
 
-## Author
-
-Javier - [@javiertradess](https://x.com/javiertradess)
+**Recent Updates:**
+- ✅ Three-phase curriculum learning (Phase 3 Hybrid LLM)
+- ✅ Continue training from any checkpoint
+- ✅ Action space optimization (9→6 actions in Phase 2)
+- ✅ Automatic data corruption detection & fixing
+- ✅ Thread pool management for stable training
+- ✅ Comprehensive testing framework
+- ✅ Smart model detection and auto-loading
+- ✅ Multi-market support with auto contract specs
 
 ---
 
 **Getting Started**: Run `python main.py` and follow the interactive menu!
-
-## Recent Updates
-
-### Continue Training Feature (Latest)
-- ✅ Resume training from any saved model
-- ✅ Smart model detection - no need to remember filenames
-- ✅ Test and production modes supported
-- ✅ Preserves timestep count and training progress
-- ✅ Custom save names after training completion
-- ✅ Phase 2 auto-detects newest Phase 1 model
-
-### System Optimizations
-- ✅ Thread pool management for stable training on constrained systems
-- ✅ Improved multi-environment handling
-- ✅ Enhanced error messages and diagnostics
-- ✅ VecNormalize state preservation
-
----
 
 **Star this repo if you find it useful!** ⭐

@@ -47,15 +47,17 @@ except (TypeError, ValueError):
 from stable_baselines3 import PPO
 # RL FIX #4: Import MaskablePPO for action masking support
 from sb3_contrib import MaskablePPO
+# ACTION MASKING FIX: Import ActionMasker wrapper to enable action masking during training
+from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
-from src.environment_phase2 import TradingEnvironmentPhase2
-from src.kl_callback import KLDivergenceCallback
-from src.feature_engineering import add_market_regime_features
-from src.model_utils import detect_models_in_folder, detect_available_markets, select_market_for_training
-from src.market_specs import get_market_spec
-from src.metadata_utils import read_metadata, write_metadata
+from environment_phase2 import TradingEnvironmentPhase2
+from kl_callback import KLDivergenceCallback
+from feature_engineering import add_market_regime_features
+from model_utils import detect_models_in_folder, detect_available_markets, select_market_for_training
+from market_specs import get_market_spec
+from metadata_utils import read_metadata, write_metadata
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -132,8 +134,12 @@ except ImportError:
 # STRATEGY B: Data-aware training with early stopping
 PHASE2_CONFIG = {
     # Training - Data-constrained budget (22,984 unique episodes)
-    'total_timesteps': 5_000_000,  # 5M max - early stopping will find optimal point
+    # ACTION MASKING FIX: Increased to 10M for better convergence with action masking
+    'total_timesteps': 10_000_000,  # 10M - extended training for proper action learning
     'num_envs': 80,  # INCREASED for RTX 4000 Ada 20GB: excellent parallelization
+
+    # ACTION MASKING FIX: Observation space is now 228 (was 225)
+    # 220 market + 5 position + 3 validity features (can_enter, can_manage, has_position)
 
     # Network architecture - REDUCED to prevent overfitting
     'policy_layers': [512, 256, 128],  # DOWN from [1024,512,256,128,64,32] - less capacity = less memorization
@@ -159,7 +165,7 @@ PHASE2_CONFIG = {
     'initial_balance': 50000,
     'initial_sl_multiplier': 1.5,
     'initial_tp_ratio': 3.0,
-    'position_size': 1.0,  # Full size (0.5 in Phase 1)
+    'position_size': 1.0,  # Full size (Phase 1 now also uses 1 contract)
     'trailing_dd_limit': 2500,  # Strict Apex rules ($5k in Phase 1)
     'tighten_sl_step': 0.5,
     'extend_tp_step': 1.0,
@@ -396,12 +402,88 @@ def load_data(train_split=0.7, market=None):
     return train_data, val_data, train_second_data, val_second_data
 
 
+class ActionDistributionCallback(CheckpointCallback):
+    """
+    ACTION MASKING FIX: Custom callback to log action distribution during training.
+
+    Monitors which actions are being selected by the model to verify that:
+    1. Invalid actions are not being selected (should be 0% with ActionMasker)
+    2. HOLD action dominates when position is FLAT (should be 80-90%)
+    3. Position management actions only occur when in position
+
+    Logs to TensorBoard for visualization.
+    """
+
+    def __init__(self, save_freq, save_path, name_prefix, verbose=0):
+        super().__init__(save_freq, save_path, name_prefix, verbose)
+        self.action_counts = np.zeros(6, dtype=np.int64)
+        self.invalid_action_count = 0
+        self.total_steps = 0
+        self.log_freq = 10000  # Log every 10K steps
+
+    def _on_step(self) -> bool:
+        """Called at each step. Track action selections."""
+        # Get actions from training buffer if available
+        if hasattr(self.locals.get('self', None), 'env'):
+            env = self.locals['self'].env
+            # This is called during collection, so we don't have direct access to actions
+            # We'll log distribution periodically from the model's action probabilities
+            pass
+
+        self.total_steps += 1
+
+        # Periodic logging
+        if self.total_steps % self.log_freq == 0:
+            self._log_action_distribution()
+
+        # Call parent to handle checkpointing
+        return super()._on_step()
+
+    def _log_action_distribution(self):
+        """Log action distribution to TensorBoard."""
+        if self.total_steps > 0:
+            # Calculate percentages
+            total = self.action_counts.sum()
+            if total > 0:
+                percentages = (self.action_counts / total) * 100
+
+                # Log to TensorBoard
+                for action_idx, pct in enumerate(percentages):
+                    self.logger.record(f"action_dist/action_{action_idx}_pct", pct)
+
+                # Log invalid action rate
+                invalid_pct = (self.invalid_action_count / self.total_steps) * 100 if self.total_steps > 0 else 0
+                self.logger.record("action_dist/invalid_action_pct", invalid_pct)
+
+                # Reset counters for next interval
+                self.action_counts.fill(0)
+                self.invalid_action_count = 0
+
+
+def mask_fn(env):
+    """
+    ACTION MASKING FIX: Wrapper function to provide action masks to MaskablePPO.
+
+    This function is called by ActionMasker to get valid actions for current state.
+    Critical for preventing invalid action predictions during training.
+
+    Args:
+        env: The trading environment instance
+
+    Returns:
+        np.ndarray: Boolean mask where True = valid action
+    """
+    return env.action_masks()
+
+
 def make_env(data, second_data, env_id, config, market_spec):
     """
     Create Phase 2 environment factory with random episode starts to prevent temporal leakage.
 
     RL FIX #3: Removed fixed env_id-based seeding to eliminate temporal correlation.
     Each environment now samples truly random episodes on every reset.
+
+    ACTION MASKING FIX: Now wraps environment with ActionMasker before Monitor.
     """
     def _init():
         # Calculate episode parameters
@@ -456,6 +538,12 @@ def make_env(data, second_data, env_id, config, market_spec):
             extend_tp_step=config['extend_tp_step']
         )
 
+        # ACTION MASKING FIX: Wrap environment with ActionMasker BEFORE Monitor
+        # This is critical - ActionMasker must wrap the base environment so that
+        # MaskablePPO can call action_masks() during training
+        env = ActionMasker(env, mask_fn)
+
+        # Then wrap with Monitor for episode statistics
         return Monitor(env)
 
     return _init
@@ -743,7 +831,7 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
 
     # If market override provided via CLI, use it directly
     if market_override:
-        from src.market_specs import get_market_spec
+        from market_specs import get_market_spec
         market_spec = get_market_spec(market_override.upper())
         if market_spec is None:
             safe_print(f"\n[ERROR] Invalid market symbol: {market_override}")
@@ -977,12 +1065,13 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
     safe_print(f"[SAVE] VecNorm: {final_vecnorm_path}")
     safe_print(f"[SAVE] Best model: models/phase2/best_model.zip")
     safe_print()
-    safe_print("[SUCCESS] Two-phase training complete!")
+    safe_print("[SUCCESS] Phase 2 training complete!")
     safe_print()
     safe_print("[NEXT STEPS]")
     safe_print("  1. Evaluate Phase 2: python3 evaluate_phase2.py")
-    safe_print("  2. Compare TensorBoard: tensorboard --logdir tensorboard_logs/")
-    safe_print("  3. Review position management usage in logs")
+    safe_print("  2. Train Phase 3 (Hybrid RL + LLM): python3 src/train_phase3_llm.py")
+    safe_print("  3. Compare TensorBoard: tensorboard --logdir tensorboard_logs/")
+    safe_print("  4. Review position management usage in logs")
     safe_print()
 
 

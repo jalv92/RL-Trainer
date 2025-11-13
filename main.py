@@ -96,10 +96,9 @@ class RLTrainerMenu:
         }
         
         self.training_menu_options = {
-            "1": "Training Test (Local Testing)",
-            "2": "Training Pod (Production)",
-            "3": "Continue from Existing Model",
-            "4": "Back to Main Menu"
+            "1": "Complete Training Pipeline (Test Mode)",
+            "2": "Complete Training Pipeline (Production Mode)",
+            "3": "Back to Main Menu"
         }
     
     def setup_logging(self):
@@ -209,7 +208,7 @@ class RLTrainerMenu:
         """
         try:
             # Import market detection utilities from model_utils
-            sys.path.insert(0, str(self.src_dir))
+            # Note: src directory should already be in sys.path from line 29
             from model_utils import detect_available_markets
             from market_specs import get_market_spec
 
@@ -299,7 +298,7 @@ class RLTrainerMenu:
         print()
 
         for key, value in self.training_menu_options.items():
-            if key == "4":  # Back option
+            if key == "3":  # Back option
                 print(f"{Colors.YELLOW}  {key}. {value}{Colors.RESET}")
             else:
                 print(f"{Colors.GREEN}  {key}. {value}{Colors.RESET}")
@@ -433,7 +432,8 @@ class RLTrainerMenu:
                     f.write(f"{datetime.now().isoformat()} - {description}\n")
                     f.write(f"Command: {' '.join(command)}\n")
                     f.write(f"Return Code: {process.returncode}\n")
-                    f.write(f"Output:\n{'\n'.join(output_lines)}\n")
+                    output_text = '\n'.join(output_lines)
+                    f.write(f"Output:\n{output_text}\n")
             
             return success, '\n'.join(output_lines)
             
@@ -689,226 +689,395 @@ class RLTrainerMenu:
                 break
 
             if choice == "1":
-                self.run_training_test()
+                self.run_complete_pipeline_test()
                 break
             elif choice == "2":
-                self.run_training_production()
+                self.run_complete_pipeline_production()
                 break
             elif choice == "3":
-                self.continue_from_model()
-                break
-            elif choice == "4":
                 print(f"{Colors.YELLOW}Returning to main menu...{Colors.RESET}")
                 break
             else:
                 print(f"{Colors.RED}Invalid option. Please try again.{Colors.RESET}")
-    
-    def run_training_test(self):
-        """Run training in test mode."""
-        print(f"\n{Colors.BOLD}{Colors.YELLOW}TRAINING TEST MODE{Colors.RESET}")
-        print(f"{Colors.CYAN}This will run a quick test with reduced dataset for local testing.{Colors.RESET}")
+
+    def run_complete_pipeline_test(self):
+        """Run complete 3-phase training pipeline in test mode."""
+        print(f"\n{Colors.BOLD}{Colors.YELLOW}COMPLETE TRAINING PIPELINE - TEST MODE{Colors.RESET}")
+        print(f"{Colors.CYAN}This will run all 3 phases sequentially with reduced timesteps.{Colors.RESET}")
+        print(f"\n{Colors.BOLD}Pipeline Overview:{Colors.RESET}")
+        print(f"{Colors.GREEN}  Phase 1: Entry Learning (5-10 minutes){Colors.RESET}")
+        print(f"{Colors.GREEN}  Phase 2: Position Management (10-15 minutes){Colors.RESET}")
+        print(f"{Colors.GREEN}  Phase 3: Hybrid LLM Agent (15-20 minutes){Colors.RESET}")
+        print(f"{Colors.YELLOW}  Total Estimated Time: 30-45 minutes{Colors.RESET}")
+        print()
 
         # Confirm
         confirm = self.get_user_input(
-            f"{Colors.YELLOW}Proceed with test training? (y/n): {Colors.RESET}",
+            f"{Colors.YELLOW}Proceed with complete pipeline test? (y/n): {Colors.RESET}",
             ["y", "n", "Y", "N"]
         )
 
         if confirm is None or confirm.lower() != 'y':
-            print(f"{Colors.YELLOW}Test training cancelled.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Pipeline test cancelled.{Colors.RESET}")
             return False
 
-        # Market selection
+        # Market selection - ONCE for entire pipeline
         selected_market = self.detect_and_select_market()
         if selected_market is None:
-            print(f"{Colors.YELLOW}Test training cancelled - no market selected.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Pipeline cancelled - no market selected.{Colors.RESET}")
             return False
 
-        # Phase 1 Test Training
-        phase1_script = self.src_dir / "train_phase1.py"
-        if phase1_script.exists():
-            print(f"\n{Colors.GREEN}Starting Phase 1 Test Training...{Colors.RESET}")
-            command = [sys.executable, str(phase1_script), "--test", "--market", selected_market, "--non-interactive"]
-            success, output = self.run_command_with_progress(
-                command,
-                "Phase 1 Test Training",
-                "training_phase1_test.log"
-            )
+        print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}Starting Complete Training Pipeline for {selected_market}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.RESET}\n")
 
-            if not success:
-                print(f"{Colors.RED}Phase 1 test training failed.{Colors.RESET}")
-                return False
+        import time
+        pipeline_start_time = time.time()
 
-        # Phase 2 Test Training
-        phase2_script = self.src_dir / "train_phase2.py"
-        if phase2_script.exists():
-            print(f"\n{Colors.GREEN}Starting Phase 2 Test Training...{Colors.RESET}")
-            command = [sys.executable, str(phase2_script), "--test", "--market", selected_market, "--non-interactive"]
-            success, output = self.run_command_with_progress(
-                command,
-                "Phase 2 Test Training",
-                "training_phase2_test.log"
-            )
-            
-            if not success:
-                print(f"{Colors.RED}Phase 2 test training failed.{Colors.RESET}")
-                return False
-        
-        print(f"\n{Colors.GREEN}✓ Test training completed successfully!{Colors.RESET}")
-        print(f"{Colors.CYAN}Models saved in models/{Colors.RESET}")
-        return True
-    
-    def run_training_production(self):
-        """Run training in production mode."""
-        print(f"\n{Colors.BOLD}{Colors.YELLOW}TRAINING PRODUCTION MODE{Colors.RESET}")
-        print(f"{Colors.CYAN}This will run full production training on the complete dataset.{Colors.RESET}")
-        print(f"{Colors.RED}Warning: This may take several hours to complete.{Colors.RESET}")
-
-        # Confirm
-        confirm = self.get_user_input(
-            f"{Colors.YELLOW}Proceed with production training? (y/n): {Colors.RESET}",
-            ["y", "n", "Y", "N"]
-        )
-
-        if confirm is None or confirm.lower() != 'y':
-            print(f"{Colors.YELLOW}Production training cancelled.{Colors.RESET}")
-            return False
-
-        # Market selection
-        selected_market = self.detect_and_select_market()
-        if selected_market is None:
-            print(f"{Colors.YELLOW}Production training cancelled - no market selected.{Colors.RESET}")
-            return False
-
-        # Phase 1 Production Training
-        phase1_script = self.src_dir / "train_phase1.py"
-        if phase1_script.exists():
-            print(f"\n{Colors.GREEN}Starting Phase 1 Production Training...{Colors.RESET}")
-            command = [sys.executable, str(phase1_script), "--market", selected_market, "--non-interactive"]
-            success, output = self.run_command_with_progress(
-                command,
-                "Phase 1 Production Training",
-                "training_phase1_production.log"
-            )
-
-            if not success:
-                print(f"{Colors.RED}Phase 1 production training failed.{Colors.RESET}")
-                return False
-
-        # Phase 2 Production Training
-        phase2_script = self.src_dir / "train_phase2.py"
-        if phase2_script.exists():
-            print(f"\n{Colors.GREEN}Starting Phase 2 Production Training...{Colors.RESET}")
-            command = [sys.executable, str(phase2_script), "--market", selected_market, "--non-interactive"]
-            success, output = self.run_command_with_progress(
-                command,
-                "Phase 2 Production Training",
-                "training_phase2_production.log"
-            )
-            
-            if not success:
-                print(f"{Colors.RED}Phase 2 production training failed.{Colors.RESET}")
-                return False
-        
-        print(f"\n{Colors.GREEN}✓ Production training completed successfully!{Colors.RESET}")
-        print(f"{Colors.CYAN}Models saved in models/{Colors.RESET}")
-        return True
-
-    def continue_from_model(self):
-        """Continue training from an existing model in the models folder."""
-        print(f"\n{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.CYAN}║                CONTINUE TRAINING FROM MODEL                   ║{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
-
-        # Detect available Phase 1 models
-        print(f"\n{Colors.CYAN}Scanning for available Phase 1 models...{Colors.RESET}")
-        models = detect_models_in_folder(phase='phase1')
-
-        # Display and get selection
-        selected_idx = display_model_selection(models, phase_filter='phase1')
-
-        if selected_idx == -1:
-            print(f"{Colors.YELLOW}No model selected. Returning to training menu...{Colors.RESET}")
-            return False
-
-        selected_model = models[selected_idx]
-
-        print(f"\n{Colors.GREEN}Selected model: {selected_model['name']}{Colors.RESET}")
-        print(f"{Colors.CYAN}Path: {selected_model['path']}{Colors.RESET}")
-
-        if not selected_model['vecnorm_path']:
-            print(f"\n{Colors.RED}⚠ Warning: No VecNormalize file found for this model!{Colors.RESET}")
-            print(f"{Colors.YELLOW}Training may not work correctly without normalization statistics.{Colors.RESET}")
-            confirm = self.get_user_input(
-                f"{Colors.YELLOW}Continue anyway? (y/n): {Colors.RESET}",
-                ["y", "n", "Y", "N"]
-            )
-            if confirm is None or confirm.lower() != 'y':
-                print(f"{Colors.YELLOW}Operation cancelled.{Colors.RESET}")
-                return False
-
-        # Ask for test or production mode
-        print(f"\n{Colors.CYAN}Select training mode:{Colors.RESET}")
-        print(f"{Colors.GREEN}  1. Test Mode (Local Testing - reduced timesteps){Colors.RESET}")
-        print(f"{Colors.GREEN}  2. Production Mode (Full Training){Colors.RESET}")
-
-        mode_choice = self.get_user_input(
-            f"{Colors.YELLOW}Select mode (1 or 2): {Colors.RESET}",
-            ["1", "2"]
-        )
-
-        if mode_choice is None:
-            print(f"{Colors.YELLOW}Operation cancelled.{Colors.RESET}")
-            return False
-
-        test_mode = (mode_choice == "1")
-        mode_name = "Test" if test_mode else "Production"
-
-        # Confirm
-        print(f"\n{Colors.BOLD}{Colors.YELLOW}CONFIRMATION{Colors.RESET}")
-        print(f"{Colors.CYAN}Model: {selected_model['name']}{Colors.RESET}")
-        print(f"{Colors.CYAN}Mode: {mode_name}{Colors.RESET}")
-
-        confirm = self.get_user_input(
-            f"{Colors.YELLOW}Proceed with continuing training? (y/n): {Colors.RESET}",
-            ["y", "n", "Y", "N"]
-        )
-
-        if confirm is None or confirm.lower() != 'y':
-            print(f"{Colors.YELLOW}Training cancelled.{Colors.RESET}")
-            return False
-
-        # Market selection
-        selected_market = self.detect_and_select_market()
-        if selected_market is None:
-            print(f"{Colors.YELLOW}Training cancelled - no market selected.{Colors.RESET}")
-            return False
-
-        # Run Phase 1 training with continuation
+        # ============================================
+        # PHASE 1: Entry Learning
+        # ============================================
         phase1_script = self.src_dir / "train_phase1.py"
         if not phase1_script.exists():
-            print(f"{Colors.RED}Error: Phase 1 training script not found!{Colors.RESET}")
+            print(f"{Colors.RED}Error: Phase 1 training script not found{Colors.RESET}")
             return False
 
-        print(f"\n{Colors.GREEN}Starting Phase 1 Continuation Training ({mode_name} Mode)...{Colors.RESET}")
+        print(f"\n{Colors.BOLD}{Colors.GREEN}[1/3] PHASE 1: Entry Learning{Colors.RESET}")
+        print(f"{Colors.CYAN}Training agent to recognize entry signals...{Colors.RESET}\n")
 
-        # Build command with --continue flag
-        command = [sys.executable, str(phase1_script), "--continue", "--model-path", selected_model['path'], "--market", selected_market, "--non-interactive"]
-        if test_mode:
-            command.append("--test")
+        phase1_start = time.time()
+        command = [
+            sys.executable, str(phase1_script),
+            "--test",
+            "--market", selected_market,
+            "--non-interactive"
+        ]
 
         success, output = self.run_command_with_progress(
             command,
-            f"Phase 1 Continuation Training ({mode_name})",
-            f"training_phase1_continue_{mode_name.lower()}.log"
+            "Phase 1: Entry Learning (Test Mode)",
+            "pipeline_test_phase1.log"
         )
 
+        phase1_duration = (time.time() - phase1_start) / 60
+
         if not success:
-            print(f"{Colors.RED}Phase 1 continuation training failed.{Colors.RESET}")
+            print(f"\n{Colors.RED}✗ Phase 1 failed. Pipeline stopped.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Check log: logs/pipeline_test_phase1.log{Colors.RESET}")
             return False
 
-        print(f"\n{Colors.GREEN}✓ Continuation training completed successfully!{Colors.RESET}")
-        print(f"{Colors.CYAN}Updated model saved in models/{Colors.RESET}")
+        print(f"{Colors.GREEN}✓ Phase 1 completed in {phase1_duration:.1f} minutes{Colors.RESET}")
+
+        # ============================================
+        # PHASE 2: Position Management
+        # ============================================
+        phase2_script = self.src_dir / "train_phase2.py"
+        if not phase2_script.exists():
+            print(f"{Colors.RED}Error: Phase 2 training script not found{Colors.RESET}")
+            return False
+
+        print(f"\n{Colors.BOLD}{Colors.GREEN}[2/3] PHASE 2: Position Management{Colors.RESET}")
+        print(f"{Colors.CYAN}Training agent for position and risk management...{Colors.RESET}\n")
+
+        phase2_start = time.time()
+        command = [
+            sys.executable, str(phase2_script),
+            "--test",
+            "--market", selected_market,
+            "--non-interactive"
+        ]
+
+        success, output = self.run_command_with_progress(
+            command,
+            "Phase 2: Position Management (Test Mode)",
+            "pipeline_test_phase2.log"
+        )
+
+        phase2_duration = (time.time() - phase2_start) / 60
+
+        if not success:
+            print(f"\n{Colors.RED}✗ Phase 2 failed. Pipeline stopped.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Check log: logs/pipeline_test_phase2.log{Colors.RESET}")
+            return False
+
+        print(f"{Colors.GREEN}✓ Phase 2 completed in {phase2_duration:.1f} minutes{Colors.RESET}")
+
+        # ============================================
+        # PHASE 3: Hybrid LLM Agent
+        # ============================================
+
+        # Check GPU before Phase 3
+        print(f"\n{Colors.BOLD}{Colors.GREEN}[3/3] PHASE 3: Hybrid LLM Agent{Colors.RESET}")
+        print(f"{Colors.CYAN}Checking GPU availability...{Colors.RESET}")
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+                print(f"{Colors.GREEN}✓ GPU detected: {gpu_name} ({gpu_mem:.1f}GB){Colors.RESET}")
+
+                if gpu_mem < 8:
+                    print(f"{Colors.YELLOW}⚠ Warning: GPU memory may be insufficient for optimal LLM performance.{Colors.RESET}")
+                    proceed = self.get_user_input(
+                        f"{Colors.YELLOW}Continue with Phase 3? (y/n): {Colors.RESET}",
+                        ["y", "n", "Y", "N"]
+                    )
+                    if proceed is None or proceed.lower() != 'y':
+                        print(f"{Colors.YELLOW}Phase 3 skipped. Pipeline completed through Phase 2.{Colors.RESET}")
+                        return True
+            else:
+                print(f"{Colors.YELLOW}⚠ No GPU detected. LLM inference will be slow.{Colors.RESET}")
+                proceed = self.get_user_input(
+                    f"{Colors.YELLOW}Continue with CPU (slow)? (y/n): {Colors.RESET}",
+                    ["y", "n", "Y", "N"]
+                )
+                if proceed is None or proceed.lower() != 'y':
+                    print(f"{Colors.YELLOW}Phase 3 skipped. Pipeline completed through Phase 2.{Colors.RESET}")
+                    return True
+        except ImportError:
+            print(f"{Colors.YELLOW}⚠ PyTorch not available. Using mock LLM mode.{Colors.RESET}")
+
+        phase3_script = self.src_dir / "train_phase3_llm.py"
+        if not phase3_script.exists():
+            print(f"{Colors.RED}Error: Phase 3 training script not found{Colors.RESET}")
+            print(f"{Colors.YELLOW}Pipeline completed through Phase 2 only.{Colors.RESET}")
+            return True  # Not a failure, just Phase 3 not available
+
+        print(f"\n{Colors.CYAN}Training hybrid RL + LLM agent...{Colors.RESET}\n")
+
+        phase3_start = time.time()
+        command = [
+            sys.executable, str(phase3_script),
+            "--test",
+            "--market", selected_market,
+            "--non-interactive"
+        ]
+
+        success, output = self.run_command_with_progress(
+            command,
+            "Phase 3: Hybrid LLM Agent (Test Mode)",
+            "pipeline_test_phase3.log"
+        )
+
+        phase3_duration = (time.time() - phase3_start) / 60
+
+        if not success:
+            print(f"\n{Colors.RED}✗ Phase 3 failed.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Check log: logs/pipeline_test_phase3.log{Colors.RESET}")
+            print(f"{Colors.CYAN}Note: Phase 1 and 2 models were successfully trained.{Colors.RESET}")
+            return False
+
+        print(f"{Colors.GREEN}✓ Phase 3 completed in {phase3_duration:.1f} minutes{Colors.RESET}")
+
+        # ============================================
+        # Pipeline Complete
+        # ============================================
+        total_duration = (time.time() - pipeline_start_time) / 60
+
+        print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}✓ COMPLETE PIPELINE FINISHED SUCCESSFULLY{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
+        print(f"\n{Colors.CYAN}Pipeline Summary:{Colors.RESET}")
+        print(f"{Colors.WHITE}  Market: {selected_market}{Colors.RESET}")
+        print(f"{Colors.WHITE}  Phase 1 Duration: {phase1_duration:.1f} minutes{Colors.RESET}")
+        print(f"{Colors.WHITE}  Phase 2 Duration: {phase2_duration:.1f} minutes{Colors.RESET}")
+        print(f"{Colors.WHITE}  Phase 3 Duration: {phase3_duration:.1f} minutes{Colors.RESET}")
+        print(f"{Colors.YELLOW}  Total Pipeline Time: {total_duration:.1f} minutes{Colors.RESET}")
+        print(f"\n{Colors.GREEN}All trained models saved in models/ directory{Colors.RESET}")
+        print(f"{Colors.CYAN}You can now run the Evaluator to assess model performance.{Colors.RESET}\n")
+
+        return True
+
+    def run_complete_pipeline_production(self):
+        """Run complete 3-phase training pipeline in production mode."""
+        print(f"\n{Colors.BOLD}{Colors.YELLOW}COMPLETE TRAINING PIPELINE - PRODUCTION MODE{Colors.RESET}")
+        print(f"{Colors.CYAN}This will run full production training on the complete dataset.{Colors.RESET}")
+        print(f"{Colors.RED}⚠ WARNING: This is a LONG process!{Colors.RESET}")
+        print(f"\n{Colors.BOLD}Pipeline Overview:{Colors.RESET}")
+        print(f"{Colors.GREEN}  Phase 1: Entry Learning (6-8 hours){Colors.RESET}")
+        print(f"{Colors.GREEN}  Phase 2: Position Management (8-10 hours){Colors.RESET}")
+        print(f"{Colors.GREEN}  Phase 3: Hybrid LLM Agent (12-16 hours){Colors.RESET}")
+        print(f"{Colors.YELLOW}  Total Estimated Time: 26-34 hours{Colors.RESET}")
+        print(f"\n{Colors.RED}Ensure your system will remain on and connected!{Colors.RESET}")
+        print()
+
+        # Confirm
+        confirm = self.get_user_input(
+            f"{Colors.YELLOW}Proceed with complete production pipeline? (y/n): {Colors.RESET}",
+            ["y", "n", "Y", "N"]
+        )
+
+        if confirm is None or confirm.lower() != 'y':
+            print(f"{Colors.YELLOW}Production pipeline cancelled.{Colors.RESET}")
+            return False
+
+        # Market selection - ONCE for entire pipeline
+        selected_market = self.detect_and_select_market()
+        if selected_market is None:
+            print(f"{Colors.YELLOW}Pipeline cancelled - no market selected.{Colors.RESET}")
+            return False
+
+        print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}Starting Complete Production Pipeline for {selected_market}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.RESET}\n")
+
+        import time
+        pipeline_start_time = time.time()
+
+        # ============================================
+        # PHASE 1: Entry Learning
+        # ============================================
+        phase1_script = self.src_dir / "train_phase1.py"
+        if not phase1_script.exists():
+            print(f"{Colors.RED}Error: Phase 1 training script not found{Colors.RESET}")
+            return False
+
+        print(f"\n{Colors.BOLD}{Colors.GREEN}[1/3] PHASE 1: Entry Learning (Production){Colors.RESET}")
+        print(f"{Colors.CYAN}Training agent to recognize entry signals (2M timesteps)...{Colors.RESET}\n")
+
+        phase1_start = time.time()
+        command = [
+            sys.executable, str(phase1_script),
+            "--market", selected_market,
+            "--non-interactive"
+        ]
+
+        success, output = self.run_command_with_progress(
+            command,
+            "Phase 1: Entry Learning (Production Mode)",
+            "pipeline_production_phase1.log"
+        )
+
+        phase1_duration = (time.time() - phase1_start) / 3600  # Convert to hours
+
+        if not success:
+            print(f"\n{Colors.RED}✗ Phase 1 failed. Pipeline stopped.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Check log: logs/pipeline_production_phase1.log{Colors.RESET}")
+            return False
+
+        print(f"{Colors.GREEN}✓ Phase 1 completed in {phase1_duration:.1f} hours{Colors.RESET}")
+
+        # ============================================
+        # PHASE 2: Position Management
+        # ============================================
+        phase2_script = self.src_dir / "train_phase2.py"
+        if not phase2_script.exists():
+            print(f"{Colors.RED}Error: Phase 2 training script not found{Colors.RESET}")
+            return False
+
+        print(f"\n{Colors.BOLD}{Colors.GREEN}[2/3] PHASE 2: Position Management (Production){Colors.RESET}")
+        print(f"{Colors.CYAN}Training agent for position and risk management (5M timesteps)...{Colors.RESET}\n")
+
+        phase2_start = time.time()
+        command = [
+            sys.executable, str(phase2_script),
+            "--market", selected_market,
+            "--non-interactive"
+        ]
+
+        success, output = self.run_command_with_progress(
+            command,
+            "Phase 2: Position Management (Production Mode)",
+            "pipeline_production_phase2.log"
+        )
+
+        phase2_duration = (time.time() - phase2_start) / 3600  # Convert to hours
+
+        if not success:
+            print(f"\n{Colors.RED}✗ Phase 2 failed. Pipeline stopped.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Check log: logs/pipeline_production_phase2.log{Colors.RESET}")
+            return False
+
+        print(f"{Colors.GREEN}✓ Phase 2 completed in {phase2_duration:.1f} hours{Colors.RESET}")
+
+        # ============================================
+        # PHASE 3: Hybrid LLM Agent
+        # ============================================
+
+        # Check GPU before Phase 3
+        print(f"\n{Colors.BOLD}{Colors.GREEN}[3/3] PHASE 3: Hybrid LLM Agent (Production){Colors.RESET}")
+        print(f"{Colors.CYAN}Checking GPU availability...{Colors.RESET}")
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+                print(f"{Colors.GREEN}✓ GPU detected: {gpu_name} ({gpu_mem:.1f}GB){Colors.RESET}")
+
+                if gpu_mem < 8:
+                    print(f"{Colors.YELLOW}⚠ Warning: GPU memory ({gpu_mem:.1f}GB) is below recommended 8GB.{Colors.RESET}")
+                    print(f"{Colors.YELLOW}   LLM training may be slow or fail due to memory constraints.{Colors.RESET}")
+                    proceed = self.get_user_input(
+                        f"{Colors.YELLOW}Continue with Phase 3? (y/n): {Colors.RESET}",
+                        ["y", "n", "Y", "N"]
+                    )
+                    if proceed is None or proceed.lower() != 'y':
+                        print(f"{Colors.YELLOW}Phase 3 skipped. Pipeline completed through Phase 2.{Colors.RESET}")
+                        return True
+            else:
+                print(f"{Colors.RED}✗ No GPU detected. Phase 3 requires GPU for production training.{Colors.RESET}")
+                proceed = self.get_user_input(
+                    f"{Colors.YELLOW}Attempt CPU training (NOT recommended, very slow)? (y/n): {Colors.RESET}",
+                    ["y", "n", "Y", "N"]
+                )
+                if proceed is None or proceed.lower() != 'y':
+                    print(f"{Colors.YELLOW}Phase 3 skipped. Pipeline completed through Phase 2.{Colors.RESET}")
+                    return True
+        except ImportError:
+            print(f"{Colors.RED}✗ PyTorch not available. Phase 3 cannot run.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Pipeline completed through Phase 2 only.{Colors.RESET}")
+            return True
+
+        phase3_script = self.src_dir / "train_phase3_llm.py"
+        if not phase3_script.exists():
+            print(f"{Colors.RED}Error: Phase 3 training script not found{Colors.RESET}")
+            print(f"{Colors.YELLOW}Pipeline completed through Phase 2 only.{Colors.RESET}")
+            return True  # Not a failure, just Phase 3 not available
+
+        print(f"\n{Colors.CYAN}Training hybrid RL + LLM agent (5M timesteps)...{Colors.RESET}\n")
+
+        phase3_start = time.time()
+        command = [
+            sys.executable, str(phase3_script),
+            "--market", selected_market,
+            "--non-interactive"
+        ]
+
+        success, output = self.run_command_with_progress(
+            command,
+            "Phase 3: Hybrid LLM Agent (Production Mode)",
+            "pipeline_production_phase3.log"
+        )
+
+        phase3_duration = (time.time() - phase3_start) / 3600  # Convert to hours
+
+        if not success:
+            print(f"\n{Colors.RED}✗ Phase 3 failed.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Check log: logs/pipeline_production_phase3.log{Colors.RESET}")
+            print(f"{Colors.CYAN}Note: Phase 1 and 2 models were successfully trained.{Colors.RESET}")
+            return False
+
+        print(f"{Colors.GREEN}✓ Phase 3 completed in {phase3_duration:.1f} hours{Colors.RESET}")
+
+        # ============================================
+        # Pipeline Complete
+        # ============================================
+        total_duration = (time.time() - pipeline_start_time) / 3600  # Convert to hours
+
+        print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}✓ COMPLETE PRODUCTION PIPELINE FINISHED SUCCESSFULLY{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
+        print(f"\n{Colors.CYAN}Pipeline Summary:{Colors.RESET}")
+        print(f"{Colors.WHITE}  Market: {selected_market}{Colors.RESET}")
+        print(f"{Colors.WHITE}  Phase 1 Duration: {phase1_duration:.1f} hours{Colors.RESET}")
+        print(f"{Colors.WHITE}  Phase 2 Duration: {phase2_duration:.1f} hours{Colors.RESET}")
+        print(f"{Colors.WHITE}  Phase 3 Duration: {phase3_duration:.1f} hours{Colors.RESET}")
+        print(f"{Colors.YELLOW}  Total Pipeline Time: {total_duration:.1f} hours ({total_duration/24:.1f} days){Colors.RESET}")
+        print(f"\n{Colors.GREEN}All trained models saved in models/ directory{Colors.RESET}")
+        print(f"{Colors.CYAN}Production-ready agent is now available for evaluation and deployment.{Colors.RESET}\n")
+
         return True
 
     def run_evaluation(self):

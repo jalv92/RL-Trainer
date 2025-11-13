@@ -18,7 +18,7 @@ tensorflow>=2.15.1
 
 # Reinforcement Learning
 stable-baselines3>=2.0.0
-sb3-contrib>=2.0.0  # For MaskablePPO (Phase 2)
+sb3-contrib>=2.0.0  # For MaskablePPO (Phase 1 & Phase 2 action masking)
 
 # UI/Progress Visualization
 colorama>=0.4.6
@@ -37,6 +37,14 @@ ta>=0.4.7
 
 # GPU Support (optional - uncomment if using GPU)
 # torch>=2.0.0  # For PyTorch-based components
+
+# LLM Integration (Phase 3 - required for hybrid RL+LLM agent)
+transformers>=4.35.0  # Hugging Face transformers
+torch>=2.1.0  # Required for LLM inference
+accelerate>=0.24.0  # Model acceleration
+bitsandbytes>=0.41.0  # INT8/INT4 quantization
+sentencepiece>=0.1.99  # Tokenizer support
+peft>=0.7.0  # LoRA fine-tuning (Phase 2 implementation)
 
 # ============================================================================
 # Python Version Compatibility Notes:

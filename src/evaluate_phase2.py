@@ -24,12 +24,12 @@ import pandas as pd
 from sb3_contrib import MaskablePPO  # Phase 2 uses MaskablePPO, not standard PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from src.apex_compliance_checker import ApexComplianceChecker
-from src.environment_phase2 import TradingEnvironmentPhase2
-from src.feature_engineering import add_market_regime_features
-from src.market_specs import ES_SPEC, get_market_spec
-from src.metadata_utils import read_metadata
-from src.model_utils import (
+from apex_compliance_checker import ApexComplianceChecker
+from environment_phase2 import TradingEnvironmentPhase2
+from feature_engineering import add_market_regime_features
+from market_specs import ES_SPEC, get_market_spec
+from metadata_utils import read_metadata
+from model_utils import (
     detect_available_markets,
     detect_models_in_folder,
     select_market_for_training,
@@ -671,7 +671,7 @@ def main():
 
     # If market override provided via CLI, use it directly
     if args.market:
-        from src.market_specs import get_market_spec
+        from market_specs import get_market_spec
         market_spec = get_market_spec(args.market.upper())
         if market_spec is None:
             safe_print(f"\n[ERROR] Invalid market symbol: {args.market}")

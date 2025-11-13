@@ -36,8 +36,12 @@ venv.bak/
 # PyCharm
 .idea/
 
-# VS Code
-.vscode/
+# VS Code (allow settings.json, extensions.json but ignore user-specific files)
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -125,8 +129,8 @@ yarn.lock
 .dmypy.json
 dmypy.json
 
-# Pyright
-pyrightconfig.json
+# Pyright (allow project config, but can uncomment if you want user-specific configs)
+# pyrightconfig.json
 
 # Documentation build
 docs/_build/
@@ -152,3 +156,9 @@ docs/.doctrees/
 docs/twitter_thread_content.md
 docs/twitter_thread_content_ES.md
 docs/x_posts.md
+
+# Production folders and files
+.kilocode/
+.claude/
+AGENTS.md
+Claude.md

@@ -1,0 +1,103 @@
+# LLM Configuration for Hybrid Trading Agent
+# Phase 3: RL + LLM Integration
+
+# LLM Model Selection
+llm_model:
+  name: "microsoft/Phi-3-mini-4k-instruct"  # 3.8B parameters, ~4GB VRAM with INT8
+  quantization: "int8"  # Options: int8, int4, none
+  device: "auto"  # Options: auto, cuda, cpu
+  max_new_tokens: 50  # Max tokens for LLM response
+  temperature: 0.1  # Low temperature for consistent trading advice
+  top_p: 0.9  # Nucleus sampling parameter
+  do_sample: true  # Enable sampling for varied responses
+
+# Decision Fusion Parameters
+fusion:
+  llm_weight: 0.3  # How much to trust LLM (0.0 = RL only, 1.0 = LLM only)
+  confidence_threshold: 0.7  # Minimum confidence to override RL decision
+  use_selective_querying: true  # Only query LLM when needed (reduces latency)
+  query_interval: 5  # Query LLM every N bars when not uncertain
+  cache_llm_responses: true  # Cache LLM responses for reuse
+  cache_decay_rate: 0.8  # Decay cached confidence by this factor
+
+# Feature Configuration
+features:
+  use_llm_features: true  # Enable 261D observations
+  observation_dim: 261  # Extended observation dimension
+  account_features: true  # Include account state in observations
+  trade_memory_features: true  # Include trade history in observations
+  risk_features: true  # Include risk metrics in observations
+  pattern_features: true  # Include pattern recognition in observations
+
+# Risk Management Configuration
+risk:
+  max_consecutive_losses: 3  # Block new entries after this many losses
+  min_win_rate_threshold: 0.4  # Block entries if win rate below this
+  dd_buffer_threshold: 0.2  # Block aggressive actions if DD buffer < this
+  enable_risk_veto: true  # Enable risk-based action veto
+
+# Prompt Templates
+prompts:
+  system: |
+    You are a professional futures trader analyzing NQ (Nasdaq-100 E-mini).
+    Provide concise trading advice based on market context and risk management.
+    
+    Available actions: HOLD, BUY, SELL, MOVE_TO_BE, ENABLE_TRAIL, DISABLE_TRAIL
+    Respond format: ACTION | confidence (0-1) | brief_reason (max 10 words)
+    
+    Guidelines:
+    - Consider trend strength, momentum, and support/resistance
+    - Factor in recent performance and risk metrics
+    - Be decisive but cautious with low confidence
+    - Prioritize capital preservation on losing streaks
+    
+  context_template: |
+    Market: {market_name}
+    Time: {current_time} ET
+    Price: ${current_price:.2f}
+    
+    Trend Analysis:
+    - ADX: {adx:.1f} (trend strength)
+    - Price vs VWAP: {vwap_distance:+.2%}
+    - RSI: {rsi:.1f}
+    - Momentum: {momentum:.1f}
+    
+    Position: {position_status}
+    Unrealized P&L: ${unrealized_pnl:+.0f}
+    
+    Recent Performance:
+    - Win Rate: {win_rate:.1%}
+    - Consecutive Losses: {consecutive_losses}
+    - Account Balance: ${balance:.0f}
+    
+    What is your recommended action?
+
+# Performance Optimization
+performance:
+  enable_cuda_graph: false  # Enable for better GPU performance (requires PyTorch 2.0+)
+  use_flash_attention: true  # Use Flash Attention if available
+  compile_model: false  # Compile model for faster inference (PyTorch 2.0+)
+  batch_inference: false  # Enable batching for multiple queries
+  max_batch_size: 8  # Maximum batch size for inference
+
+# Logging and Monitoring
+logging:
+  log_llm_queries: true  # Log all LLM queries and responses
+  log_decision_fusion: true  # Log fusion decisions
+  log_risk_veto: true  # Log risk-based vetoes
+  log_latency: true  # Log LLM inference latency
+  save_llm_responses: false  # Save LLM responses to file (for analysis)
+
+# Model Fallback Options
+fallback:
+  enable_rl_fallback: true  # Fall back to RL if LLM fails
+  enable_hold_fallback: true  # Default to HOLD if both fail
+  max_llm_errors: 10  # Switch to RL-only after this many errors
+  error_cooldown_period: 100  # Steps to wait before retrying LLM after error
+
+# Development and Testing
+development:
+  mock_llm: false  # Use mock LLM for testing (no GPU required)
+  mock_response_delay: 0.1  # Artificial delay for mock LLM (seconds)
+  mock_confidence: 0.8  # Default confidence for mock responses
+  verbose_logging: false  # Enable verbose logging for debugging

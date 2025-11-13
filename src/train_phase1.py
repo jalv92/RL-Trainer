@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Phase 1: Foundational Trading Patterns Training
-- Fixed SL/TP (1.5x ATR SL, 3:1 TP ratio)
-- 3 actions: Hold, Buy, Sell
-- Focus: Entry signal quality
-- Duration: 5M timesteps (~6-8 hours on RTX 4000 Ada 20GB)
 
-Based on: OpenAI Spinning Up PPO + Stable Baselines3
-Optimized for: RunPod RTX 4000 Ada deployment
+Optimized training approach with:
+1. Simplified reward function focusing on entry quality
+2. Relaxed constraints (trailing DD, daily loss limit, profit target)
+3. Simplified observation space (removed complex features)
+4. Better reward magnitudes for stronger learning signal
+5. Enhanced exploration parameters
+
+Designed to learn quality entry signals before advancing to Phase 2 position management.
 """
 
 import os
 
-# Limit math/BLAS thread pools before importing numpy/torch to prevent
-# pthread/resource exhaustion on constrained hosts.
+# Limit math/BLAS thread pools before importing numpy/torch
 try:
     _THREAD_LIMIT_INT = max(1, int(os.environ.get("TRAINER_MAX_BLAS_THREADS", "1")))
 except ValueError:
@@ -36,6 +37,10 @@ import torch
 import numpy as np
 import pandas as pd
 
+# Add project root to path for imports
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
 _TORCH_THREADS_OVERRIDE = os.environ.get("PYTORCH_NUM_THREADS")
 try:
     if _TORCH_THREADS_OVERRIDE is not None:
@@ -43,21 +48,23 @@ try:
     else:
         torch.set_num_threads(_THREAD_LIMIT_INT)
 except (TypeError, ValueError):
-    # Fall back to deterministic single-thread execution if override is invalid
     torch.set_num_threads(1)
-from stable_baselines3 import PPO
+
+from sb3_contrib import MaskablePPO  # Using MaskablePPO for action masking
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
-from src.environment_phase1 import TradingEnvironmentPhase1
-from src.kl_callback import KLDivergenceCallback
-from src.feature_engineering import add_market_regime_features
-from src.model_utils import get_model_save_name, detect_available_markets, select_market_for_training
-from src.market_specs import get_market_spec
-from src.metadata_utils import write_metadata
+
+# IMPORT PHASE 1 ENVIRONMENT
+from environment_phase1 import TradingEnvironmentPhase1
+from kl_callback import KLDivergenceCallback
+from feature_engineering import add_market_regime_features
+from model_utils import get_model_save_name, detect_available_markets, select_market_for_training
+from market_specs import get_market_spec
+from metadata_utils import write_metadata
 
 # Set UTF-8 encoding for Windows compatibility
-if os.name == 'nt':  # Windows
+if os.name == 'nt':
     try:
         import codecs
         sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'replace')
@@ -79,12 +86,9 @@ def safe_print(message=""):
             '❌': '[X]',
             '→': '->',
             '⚠': '[WARN]',
-            '⚠️': '[WARN]',
             '—': '-',
             '–': '-',
             '’': "'",
-            '“': '"',
-            '”': '"',
         }
         ascii_message = message
         for src, target in replacements.items():
@@ -127,101 +131,85 @@ except ImportError:
     safe_print("[WARNING] Install with: pip install 'stable-baselines3[extra]'")
     safe_print("[WARNING] Training will continue without progress bar visualization")
 
-# PPO Hyperparameters (optimized for RTX 4000 Ada 20GB VRAM)
-# Production config for RunPod deployment
-# STRATEGY B: Data-aware training with early stopping
+# MaskablePPO Hyperparameters - Optimized for Phase 1 with Action Masking
+# Training approach:
+# - 5M timesteps for production (100K for test mode)
+# - Simplified reward function for entry quality
+# - Enhanced exploration parameters
 PHASE1_CONFIG = {
-    # Training - Data-constrained budget (22,984 unique episodes)
-    'total_timesteps': 2_000_000,  # 2M max - early stopping will find optimal point
-    'num_envs': 80,  # INCREASED for RTX 4000 Ada 20GB: excellent parallelization
+    # Training - INCREASED for better data coverage and robust learning
+    'total_timesteps': 5_000_000,  # 5M for production (covers 80% of training data)
+    'num_envs': 80,  # Parallel environments
 
-    # Network architecture - REDUCED to prevent overfitting
-    'policy_layers': [512, 256, 128],  # DOWN from [1024, 512, 256, 128] - FIX #3
+    # Network architecture - MAINTAINED for capacity
+    'policy_layers': [512, 256, 128],
 
-    # PPO parameters (from OpenAI Spinning Up)
+    # MaskablePPO parameters - ENHANCED for exploration
     'learning_rate': 3e-4,
     'n_steps': 2048,  # Rollout length
-    # OPTIMIZED batch size for RTX 4000 Ada
-    # Calculation: 80 envs × 2048 steps = 163,840 samples per update
-    # 163,840 / 512 = 320 minibatches (excellent balance)
-    # Larger batch = better GPU utilization while maintaining generalization
-    'batch_size': 512,  # INCREASED from 256 for 20GB GPU
+    'batch_size': 512,
     'n_epochs': 10,  # Optimization epochs per update
     'gamma': 0.99,  # Discount factor
     'gae_lambda': 0.95,  # GAE parameter
-    'clip_range': 0.2,  # PPO clip range
-    'ent_coef': 0.01,  # Entropy coefficient (exploration)
+    'clip_range': 0.2,  # Clip range
+    'ent_coef': 0.02,  # INCREASED from 0.01 for more exploration
     'vf_coef': 0.5,  # Value function coefficient
     'max_grad_norm': 0.5,  # Gradient clipping
 
-    # NEW: Learning rate scheduling
+    # Learning rate scheduling
     'use_lr_schedule': True,
     'lr_final_fraction': 0.2,  # End at 20% of initial LR
 
-    # NEW: Early stopping with KL monitoring
+    # Early stopping with KL monitoring
     'target_kl': 0.01,
     'use_kl_callback': True,
 
-    # Environment parameters
+    # Environment parameters - RELAXED for Phase 1
     'window_size': 20,
     'initial_balance': 50000,
     'initial_sl_multiplier': 1.5,
     'initial_tp_ratio': 3.0,
-    'position_size': 0.5,
-    'trailing_dd_limit': 5000,  # Relaxed for Phase 1
-    'episode_length': 390,  # NEW: 1 trading day
+    'position_size': 1.0,  # Futures exchanges require whole contracts
+    'trailing_dd_limit': 15000,  # RELAXED from 5000 (was too restrictive)
+    'episode_length': 390,  # 1 trading day
 
-    # Market specifications (optional override)
-    'commission_override': None,  # None = use market default, or set custom value (e.g., 1.50)
+    # Market specifications
+    'commission_override': None,
 
-    # Evaluation - More frequent for better early stopping
-    'eval_freq': 50_000,  # Every 50K = 40 evals max (2M / 50K)
-    'n_eval_episodes': 10,  # Increased from 5 for more reliable estimates
+    # Evaluation - More frequent for better feedback
+    'eval_freq': 50_000,  # Every 50K steps
+    'n_eval_episodes': 10,
 
-    # Early stopping - Prevent overfitting with limited data
+    # Early stopping - ENABLED but looser
     'use_early_stopping': True,
-    'early_stop_max_no_improvement': 5,  # Stop after 5 evals with no improvement
-    'early_stop_min_evals': 3,  # Require at least 3 evals before stopping can trigger
+    'early_stop_max_no_improvement': 8,  # INCREASED from 5 (more patience)
+    'early_stop_min_evals': 5,  # INCREASED from 3
 
     # Device configuration
-    # SWITCHED TO GPU FOR TESTING (heavy environment bottleneck detected)
-    # Heavy feature engineering (33 features) + dual data sources (minute + second-level)
-    # CPU environment overhead (~80-100ms) > GPU data transfer overhead (~20-30ms)
-    # GPU freed CPU to handle environment simulation better
-    'device': 'cuda'  # Testing GPU for heavy environment scenarios
+    'device': 'cuda'
 }
 
 
 def create_lr_schedule(initial_lr, final_fraction, total_timesteps):
     """Create linear learning rate schedule."""
     def lr_schedule(progress):
-        # progress goes from 0 to 1
         return initial_lr * (1 - progress * (1 - final_fraction))
     return lr_schedule
 
+
 def find_data_file(market=None):
-    """Find training data file with priority order.
-
-    Args:
-        market: Market identifier (e.g., 'ES', 'NQ') or None for auto-detect
-
-    Returns:
-        Path to data file
-    """
-    # Get project root directory (parent of src/)
+    """Find training data file with priority order."""
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(script_dir, 'data')
 
-    # If market is specified and not GENERIC, look for market-specific file first
     if market and market != 'GENERIC':
         market_file = os.path.join(data_dir, f'{market}_D1M.csv')
         if os.path.exists(market_file):
             return market_file
 
-    # Priority order: D1M (generic 1-minute) > old ES-specific names (backward compat)
     filenames_to_try = [
-        'D1M.csv',  # New generic 1-minute data format
-        'es_training_data_CORRECTED_CLEAN.csv',  # Legacy ES format
+        'D1M.csv',
+        'es_training_data_CORRECTED_CLEAN.csv',
         'es_training_data_CORRECTED.csv',
         'databento_es_training_data_processed_cleaned.csv',
         'databento_es_training_data_processed.csv'
@@ -232,7 +220,6 @@ def find_data_file(market=None):
         if os.path.exists(path):
             return path
 
-    # Fallback: look for instrument-prefixed files like ES_D1M.csv, NQ_D1M.csv, etc.
     pattern = os.path.join(data_dir, '*_D1M.csv')
     instrument_files = sorted(glob.glob(pattern))
     if instrument_files:
@@ -247,13 +234,6 @@ def find_data_file(market=None):
 def load_data(train_split=0.7, market=None):
     """
     Load and prepare training data with proper train/val split.
-
-    Args:
-        train_split: Fraction of data to use for training (default 0.7 = 70%)
-        market: Market to load data for (e.g., 'ES', 'NQ', or None for auto-detect)
-
-    Returns:
-        train_data, val_data, train_second_data, val_second_data
     """
     data_path = find_data_file(market=market)
     safe_print(f"[DATA] Loading minute-level data from {data_path}")
@@ -278,7 +258,7 @@ def load_data(train_split=0.7, market=None):
     safe_print(f"[DATA] Loaded {len(data):,} rows")
     safe_print(f"[DATA] Full date range: {data.index.min()} to {data.index.max()}")
 
-    # CRITICAL FIX: Chronological train/val split to prevent overfitting
+    # Chronological train/val split
     train_end_idx = int(len(data) * train_split)
     train_data = data.iloc[:train_end_idx].copy()
     val_data = data.iloc[train_end_idx:].copy()
@@ -286,7 +266,6 @@ def load_data(train_split=0.7, market=None):
     safe_print(f"\n[SPLIT] Train/Val Split Applied:")
     safe_print(f"[SPLIT] Train: {len(train_data):,} bars ({train_split*100:.0f}%) - {train_data.index.min()} to {train_data.index.max()}")
     safe_print(f"[SPLIT] Val:   {len(val_data):,} bars ({(1-train_split)*100:.0f}%) - {val_data.index.min()} to {val_data.index.max()}")
-    safe_print(f"[SPLIT] Train stats: Close {train_data['close'].min():.2f}-{train_data['close'].max():.2f}, ATR {train_data['atr'].min():.4f}-{train_data['atr'].max():.4f}")
 
     # Add market regime features to BOTH splits separately (prevent leakage)
     safe_print("[DATA] Adding market regime features to train data...")
@@ -298,25 +277,20 @@ def load_data(train_split=0.7, market=None):
     # Load and split second-level data
     train_second_data = None
     val_second_data = None
-    # Get project root directory (parent of src/)
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     second_data_candidates = []
 
-    # Try market-specific file first, then generic
     if market and market != 'GENERIC':
         second_data_candidates.append(os.path.join(script_dir, 'data', f'{market}_D1S.csv'))
 
-    # Add generic file
     second_data_candidates.append(os.path.join(script_dir, 'data', 'D1S.csv'))
 
-    # Also check for wildcards in case market wasn't detected
     filename = os.path.basename(data_path)
     if filename.endswith('_D1M.csv') and len(filename) > len('_D1M.csv'):
         prefix = filename[:-len('_D1M.csv')]
         if prefix:
             second_data_candidates.append(os.path.join(script_dir, 'data', f"{prefix}_D1S.csv"))
 
-    # Remove duplicates while preserving order
     seen = set()
     unique_candidates = []
     for candidate in second_data_candidates:
@@ -358,31 +332,22 @@ def load_data(train_split=0.7, market=None):
 
 
 def make_env(data, second_data, env_id, config, market_spec):
-    """
-    Create environment factory with random episode starts to prevent temporal leakage.
-
-    RL FIX #3: Removed fixed env_id-based seeding to eliminate temporal correlation.
-    Each environment now samples truly random episodes on every reset.
-    """
+    """Create environment factory with random episode starts."""
     def _init():
         # Calculate episode parameters
-        episode_length = config.get('episode_length', 390)  # 1 trading day
+        episode_length = config.get('episode_length', 390)
         window_size = config['window_size']
 
-        # RL FIX #3: TRUE random start position (no fixed seeding)
-        # Previous: np.random.seed(env_id + 42) caused same episodes each run
-        # New: Use global random state - different episodes every time
+        # TRUE random start position (no fixed seeding)
         max_start = len(data) - episode_length - window_size
         if max_start <= window_size:
             start_idx = window_size
         else:
-            # NO SEEDING - use global random state for true randomization
-            # This prevents temporal overfitting and improves generalization
             start_idx = np.random.randint(0, max_start)
 
         end_idx = start_idx + episode_length
 
-        # Extract episode data - this creates independent episodes
+        # Extract episode data
         env_data = data.iloc[start_idx:end_idx].copy()
 
         # Filter second-level data for this episode
@@ -394,25 +359,26 @@ def make_env(data, second_data, env_id, config, market_spec):
             env_second_data = second_data[mask].copy()
 
         if env_id == 0:
-            safe_print(f"[ENV] Env {env_id}: Random start at index {start_idx}, "
-                  f"period {data.index[start_idx]} to {data.index[end_idx-1]}")
+            safe_print(f"[ENV] Env {env_id}: Random start at index {start_idx}")
             safe_print(f"[ENV] Episode length: {len(env_data)} bars")
-            safe_print(f"[ENV] Data range: {len(data)} total bars, using episodes of {episode_length}")
-            safe_print(f"[ENV] RL FIX #3: Using true random sampling (no fixed seeding)")
-            if env_second_data is not None:
-                safe_print(f"[ENV] Second-level data: {len(env_second_data)} bars")
+            safe_print(f"[ENV] Using Phase 1 environment with relaxed constraints")
 
+        # Use Phase 1 environment
         env = TradingEnvironmentPhase1(
             data=env_data,
             window_size=config['window_size'],
             initial_balance=config['initial_balance'],
-            second_data=env_second_data,  # Pass second-level data
-            market_spec=market_spec,  # NEW: Pass market spec
-            commission_override=config.get('commission_override', None),  # NEW: Optional override
+            second_data=env_second_data,
+            market_spec=market_spec,
+            commission_override=config.get('commission_override', None),
             initial_sl_multiplier=config['initial_sl_multiplier'],
             initial_tp_ratio=config['initial_tp_ratio'],
             position_size_contracts=config['position_size'],
-            trailing_drawdown_limit=config['trailing_dd_limit']
+            trailing_drawdown_limit=config['trailing_dd_limit'],
+            # NEW: Disable constraints for Phase 1
+            enable_daily_loss_limit=False,
+            enable_profit_target=False,
+            enable_4pm_rule=True,  # Keep this for safety
         )
 
         return Monitor(env)
@@ -427,14 +393,7 @@ def train_phase1(
     non_interactive=False,
     test_mode=False,
 ):
-    """Execute Phase 1 training.
-
-    Args:
-        continue_training: If True, load and continue training from existing model
-        model_path: Path to existing model to continue from
-        market_override: Optional market symbol to use (ES, NQ, etc.). If None, will prompt interactively.
-        non_interactive: If True, run in non-interactive mode (no prompts, use defaults)
-    """
+    """Execute Phase 1 training with simplified reward and relaxed constraints."""
     if continue_training:
         safe_print("=" * 80)
         safe_print("PHASE 1: CONTINUING TRAINING FROM EXISTING MODEL")
@@ -444,21 +403,27 @@ def train_phase1(
         safe_print("=" * 80)
         safe_print("PHASE 1: FOUNDATIONAL TRADING PATTERNS")
         safe_print("=" * 80)
+        safe_print("[TRAINING APPROACH]")
+        safe_print("  ✓ Simplified reward function (entry quality focus)")
+        safe_print("  ✓ Relaxed constraints (trailing DD: $5K → $15K)")
+        safe_print("  ✓ Disabled daily loss limit for Phase 1")
+        safe_print("  ✓ Disabled profit target for Phase 1")
+        safe_print("  ✓ Enhanced exploration (ent_coef: 0.01 → 0.02)")
+        safe_print("  ✓ Increased patience (early stopping: 5 → 8 evals)")
+        safe_print("=" * 80)
 
     # Detect and select market
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(script_dir, 'data')
     available_markets = detect_available_markets(data_dir)
 
-    # If market override provided via CLI, use it directly
     if market_override:
-        from src.market_specs import get_market_spec
+        from market_specs import get_market_spec
         market_spec = get_market_spec(market_override.upper())
         if market_spec is None:
             safe_print(f"\n[ERROR] Invalid market symbol: {market_override}")
             safe_print("[ERROR] Valid markets: ES, NQ, YM, RTY, MNQ, MES, M2K, MYM")
             return
-        # Find the matching market data
         selected_market = next((m for m in available_markets if m['market'] == market_override.upper()), None)
         if selected_market is None:
             safe_print(f"\n[ERROR] No data found for market: {market_override}")
@@ -467,11 +432,10 @@ def train_phase1(
         market_name = market_override.upper()
         safe_print(f"\n[CLI] Market specified via --market: {market_name}")
     else:
-        # Interactive market selection
         selected_market, market_spec = select_market_for_training(available_markets, safe_print)
         if selected_market is None or market_spec is None:
             safe_print("\n[INFO] Training cancelled - no market selected")
-            return  # User cancelled or no data
+            return
         market_name = selected_market['market']
 
     safe_print(f"\n[TRAINING] Market: {market_name}")
@@ -489,9 +453,12 @@ def train_phase1(
     safe_print(f"[CONFIG] Device: {PHASE1_CONFIG['device']}")
     safe_print(f"[CONFIG] Fixed SL: {PHASE1_CONFIG['initial_sl_multiplier']}x ATR")
     safe_print(f"[CONFIG] Fixed TP: {PHASE1_CONFIG['initial_tp_ratio']}x SL")
+    safe_print(f"[CONFIG] Entropy coef: {PHASE1_CONFIG['ent_coef']} (INCREASED for exploration)")
+    safe_print(f"[CONFIG] Trailing DD limit: ${PHASE1_CONFIG['trailing_dd_limit']:,} (RELAXED)")
     safe_print("")
 
     # Create directories
+    os.makedirs('models', exist_ok=True)  # FIX: Ensure base models directory exists
     os.makedirs('models/phase1', exist_ok=True)
     os.makedirs('models/phase1/checkpoints', exist_ok=True)
     os.makedirs('logs/phase1', exist_ok=True)
@@ -500,16 +467,19 @@ def train_phase1(
     # Load data with train/val split
     train_data, val_data, train_second_data, val_second_data = load_data(train_split=0.7, market=market_name)
 
-    # Create vectorized training environments (use TRAIN data only)
+    # Create vectorized training environments
     safe_print(f"\n[ENV] Creating {num_envs} parallel TRAINING environments...")
     env_fns = [make_env(train_data, train_second_data, i, PHASE1_CONFIG, market_spec) for i in range(num_envs)]
 
-    if num_envs > 1:
-        env = SubprocVecEnv(env_fns)
-    else:
+    # Use DummyVecEnv for test mode or single env (avoids multiprocessing issues)
+    if test_mode or num_envs == 1:
+        safe_print(f"[ENV] Using DummyVecEnv ({'test mode' if test_mode else 'single env'})")
         env = DummyVecEnv(env_fns)
+    else:
+        safe_print(f"[ENV] Using SubprocVecEnv ({num_envs} processes)")
+        env = SubprocVecEnv(env_fns)
 
-    # Add normalization (critical for PPO stability)
+    # Add normalization
     env = VecNormalize(
         env,
         norm_obs=True,
@@ -520,23 +490,26 @@ def train_phase1(
 
     safe_print("[ENV] Training environments created with VecNormalize")
 
-    # Create evaluation environment (use VAL data only - CRITICAL FIX)
+    # Create evaluation environment
     safe_print("[EVAL] Creating VALIDATION environment (unseen data)...")
     eval_env = DummyVecEnv([lambda: Monitor(TradingEnvironmentPhase1(
-        data=val_data,  # CHANGED: Use validation data
+        data=val_data,
         window_size=PHASE1_CONFIG['window_size'],
         initial_balance=PHASE1_CONFIG['initial_balance'],
-        second_data=val_second_data,  # CHANGED: Use val second-level data
-        market_spec=market_spec,  # NEW: Pass market spec
-        commission_override=PHASE1_CONFIG.get('commission_override', None),  # NEW
+        second_data=val_second_data,
+        market_spec=market_spec,
+        commission_override=PHASE1_CONFIG.get('commission_override', None),
         initial_sl_multiplier=PHASE1_CONFIG['initial_sl_multiplier'],
         initial_tp_ratio=PHASE1_CONFIG['initial_tp_ratio'],
         position_size_contracts=PHASE1_CONFIG['position_size'],
-        trailing_drawdown_limit=PHASE1_CONFIG['trailing_dd_limit']
+        trailing_drawdown_limit=PHASE1_CONFIG['trailing_dd_limit'],
+        enable_daily_loss_limit=False,
+        enable_profit_target=False,
+        enable_4pm_rule=True,
     ))])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
-    # Create learning rate schedule if enabled
+    # Create learning rate schedule
     learning_rate = PHASE1_CONFIG['learning_rate']
     if PHASE1_CONFIG.get('use_lr_schedule', False):
         learning_rate = create_lr_schedule(
@@ -546,32 +519,28 @@ def train_phase1(
         )
         safe_print("[TRAIN] Using linear learning rate schedule")
     
-    # Create or load PPO model
+    # Create or load MaskablePPO model (with action masking)
     if continue_training and model_path:
-        safe_print("\n[MODEL] Loading existing PPO model...")
+        safe_print("\n[MODEL] Loading existing MaskablePPO model...")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found at: {model_path}")
 
-        # Load the existing model
-        model = PPO.load(model_path, device=PHASE1_CONFIG['device'])
-
-        # Update the environment (important for VecNormalize)
+        model = MaskablePPO.load(model_path, device=PHASE1_CONFIG['device'])
         model.set_env(env)
-
-        # Update tensorboard log directory
         model.tensorboard_log = './tensorboard_logs/phase1/'
-
         safe_print(f"[MODEL] Model loaded successfully from {model_path}")
         safe_print(f"[MODEL] Current timesteps: {model.num_timesteps:,}")
         safe_print(f"[MODEL] Will train for additional {PHASE1_CONFIG['total_timesteps']:,} timesteps")
     else:
-        safe_print("\n[MODEL] Creating NEW PPO model...")
+        safe_print("\n[MODEL] Creating NEW MaskablePPO model (with action masking)...")
         safe_print(f"[MODEL] Policy network: {PHASE1_CONFIG['policy_layers']}")
         safe_print(f"[MODEL] Initial learning rate: {PHASE1_CONFIG['learning_rate']}")
-        safe_print(f"[MODEL] Batch size: {PHASE1_CONFIG['batch_size']} (INCREASED)")
-        safe_print(f"[MODEL] PPO clip range: {PHASE1_CONFIG['clip_range']}")
+        safe_print(f"[MODEL] Batch size: {PHASE1_CONFIG['batch_size']}")
+        safe_print(f"[MODEL] Clip range: {PHASE1_CONFIG['clip_range']}")
+        safe_print(f"[MODEL] Entropy coefficient: {PHASE1_CONFIG['ent_coef']} (INCREASED for exploration)")
+        safe_print(f"[MODEL] Action masking: ENABLED (forces HOLD when in position)")
 
-        model = PPO(
+        model = MaskablePPO(
             'MlpPolicy',
             env,
             learning_rate=learning_rate,
@@ -581,7 +550,7 @@ def train_phase1(
             gamma=PHASE1_CONFIG['gamma'],
             gae_lambda=PHASE1_CONFIG['gae_lambda'],
             clip_range=PHASE1_CONFIG['clip_range'],
-            ent_coef=PHASE1_CONFIG['ent_coef'],
+            ent_coef=PHASE1_CONFIG['ent_coef'],  # INCREASED
             vf_coef=PHASE1_CONFIG['vf_coef'],
             max_grad_norm=PHASE1_CONFIG['max_grad_norm'],
             policy_kwargs={
@@ -596,10 +565,9 @@ def train_phase1(
             tensorboard_log='./tensorboard_logs/phase1/'
         )
 
-        safe_print("[MODEL] PPO model created")
+        safe_print("[MODEL] MaskablePPO model created with action masking enabled")
 
     # Callbacks
-    # STRATEGY B: Early stopping to prevent overfitting with limited data
     callbacks_list = []
 
     if PHASE1_CONFIG.get('use_early_stopping', False):
@@ -612,7 +580,6 @@ def train_phase1(
         safe_print(f"        - Stop after {PHASE1_CONFIG['early_stop_max_no_improvement']} evals with no improvement")
         safe_print(f"        - Minimum {PHASE1_CONFIG['early_stop_min_evals']} evals required")
         safe_print(f"        - Evaluation every {PHASE1_CONFIG['eval_freq']:,} timesteps")
-        safe_print(f"        - Could stop as early as: {(PHASE1_CONFIG['early_stop_min_evals'] + PHASE1_CONFIG['early_stop_max_no_improvement']) * PHASE1_CONFIG['eval_freq']:,} timesteps")
     else:
         early_stop_callback = None
         safe_print("[TRAIN] Early stopping disabled")
@@ -626,7 +593,7 @@ def train_phase1(
         deterministic=True,
         render=False,
         verbose=1,
-        callback_after_eval=early_stop_callback  # Add early stopping
+        callback_after_eval=early_stop_callback
     )
 
     checkpoint_callback = CheckpointCallback(
@@ -637,7 +604,7 @@ def train_phase1(
         save_vecnormalize=True
     )
 
-    # Build callbacks list (early_stop is already in EvalCallback via callback_after_eval)
+    # Build callbacks list
     callbacks = [eval_callback, checkpoint_callback]
     
     if PHASE1_CONFIG.get('use_kl_callback', False):
@@ -662,7 +629,6 @@ def train_phase1(
     import time
     start_time = time.time()
 
-    # Use progress bar if available, otherwise disable
     use_progress_bar = PROGRESS_BAR_AVAILABLE
     if use_progress_bar:
         safe_print("[TRAIN] Progress bar enabled (tqdm + rich available)")
@@ -675,7 +641,7 @@ def train_phase1(
             total_timesteps=PHASE1_CONFIG['total_timesteps'],
             callback=callbacks,
             progress_bar=use_progress_bar,
-            reset_num_timesteps=not continue_training  # Don't reset if continuing
+            reset_num_timesteps=not continue_training
         )
     except KeyboardInterrupt:
         safe_print("\n[TRAIN] Training interrupted by user")
@@ -686,41 +652,36 @@ def train_phase1(
 
     elapsed = time.time() - start_time
 
-    # Save final model with user-chosen name
+    # Save final model
     safe_print("\n[SAVE] Saving final Phase 1 model...")
 
     # Determine default name
     if continue_training:
-        # Extract base name from loaded model path
         base_name = os.path.splitext(os.path.basename(model_path))[0]
-        default_name = f"{base_name}_continued"
+        default_name = f"{base_name}_continued_fixed"
     else:
-        default_name = "phase1_foundational_final"
+        default_name = "phase1_foundational_fixed"
 
     if test_mode and not default_name.endswith('_test'):
         default_name = f"{default_name}_test"
         safe_print("[SAVE] Test mode run detected - using '_test' suffix for artifacts")
 
-    # Get save name from user (interactive mode only)
-    # Detect if we're in a truly interactive context
+    # Get save name
     is_interactive = (not non_interactive and
                       sys.stdin.isatty() and
                       hasattr(sys.stdin, 'readable'))
 
     if is_interactive:
         try:
-            # Additional check: stdin might be a TTY but not actually readable
             if sys.stdin.readable():
                 save_name = get_model_save_name(default_name)
             else:
                 save_name = default_name
                 safe_print(f"[SAVE] Non-interactive mode - using default name: {save_name}")
         except (EOFError, OSError):
-            # stdin not actually available despite isatty()
             save_name = default_name
             safe_print(f"[SAVE] Non-interactive mode - using default name: {save_name}")
     else:
-        # Non-interactive mode (e.g., called from menu script)
         save_name = default_name
         safe_print(f"[SAVE] Non-interactive mode - using default name: {save_name}")
 
@@ -737,6 +698,7 @@ def train_phase1(
         'timesteps_target': int(PHASE1_CONFIG['total_timesteps']),
         'test_mode': bool(test_mode),
         'continue_training': bool(continue_training),
+        'fixed_version': True,  # Mark as fixed version
     }
 
     write_metadata(model_save_path, {**metadata_common, 'artifact': 'model'})
@@ -754,46 +716,43 @@ def train_phase1(
     safe_print("[NEXT STEPS]")
     safe_print("  1. Review training logs: logs/phase1/evaluations.npz")
     safe_print("  2. Check TensorBoard: tensorboard --logdir tensorboard_logs/phase1/")
-    safe_print("  3. Run Phase 2: python3 train_phase2.py")
+    safe_print("  3. Evaluate performance: python evaluate_phase1.py")
+    safe_print("  4. Run Phase 2: python train_phase2.py")
     safe_print("")
 
 
 if __name__ == '__main__':
     import argparse
 
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Phase 1 Training')
+    parser = argparse.ArgumentParser(description='Phase 1 Training - Foundational Trading Patterns')
     parser.add_argument('--test', action='store_true',
-                       help='Run in test mode with reduced timesteps (30K for quick local testing)')
+                       help='Run in test mode with reduced timesteps (100K for better testing)')
     parser.add_argument('--continue', dest='continue_training', action='store_true',
                        help='Continue training from an existing model')
     parser.add_argument('--model-path', type=str, default=None,
                        help='Path to the model to continue training from')
     parser.add_argument('--market', type=str, default=None,
-                       help='Market to train on (ES, NQ, YM, RTY, MNQ, MES, M2K, MYM). If not specified, will prompt interactively.')
+                       help='Market to train on (ES, NQ, YM, RTY, MNQ, MES, M2K, MYM)')
     parser.add_argument('--non-interactive', action='store_true',
                        help='Run in non-interactive mode (no prompts, use defaults)')
     args = parser.parse_args()
 
-    # Override config for test mode (quick local testing)
+    # Override config for test mode
     if args.test:
         safe_print("\n" + "=" * 80)
         safe_print("TEST MODE ENABLED - Quick Local Testing")
         safe_print("=" * 80)
-        PHASE1_CONFIG['total_timesteps'] = 30_000  # Small test run
-        PHASE1_CONFIG['num_envs'] = 4  # Minimal for local CPU/small GPU
-        PHASE1_CONFIG['eval_freq'] = 10_000  # Eval 3 times (10K, 20K, 30K)
-        PHASE1_CONFIG['n_eval_episodes'] = 3  # Faster eval
+        PHASE1_CONFIG['total_timesteps'] = 100_000  # INCREASED from 30K
+        PHASE1_CONFIG['num_envs'] = 4
+        PHASE1_CONFIG['eval_freq'] = 25_000  # Eval 4 times
+        PHASE1_CONFIG['n_eval_episodes'] = 5
+        PHASE1_CONFIG['use_early_stopping'] = False  # Disable for test mode
 
-        # Disable early stopping in test mode (run full 30K)
-        PHASE1_CONFIG['use_early_stopping'] = False
-
-        safe_print(f"[TEST] Timesteps:       2M -> {PHASE1_CONFIG['total_timesteps']:,} (1.5% for testing)")
-        safe_print(f"[TEST] Parallel envs:   80 -> {PHASE1_CONFIG['num_envs']} (local machine)")
+        safe_print(f"[TEST] Timesteps:       5M → {PHASE1_CONFIG['total_timesteps']:,} (2% for testing)")
+        safe_print(f"[TEST] Parallel envs:   80 → {PHASE1_CONFIG['num_envs']} (local machine)")
         safe_print(f"[TEST] Eval frequency:  Every {PHASE1_CONFIG['eval_freq']:,} steps")
         safe_print(f"[TEST] Early stopping:  DISABLED (test mode)")
-        safe_print(f"[TEST] Expected time:   ~5-10 minutes")
-        safe_print(f"[TEST] Purpose:         Verify pipeline works before full training")
+        safe_print(f"[TEST] Expected time:   ~15-20 minutes")
         safe_print("=" * 80 + "\n")
 
     # Validate continuation arguments
@@ -805,7 +764,7 @@ if __name__ == '__main__':
         safe_print(f"\n[INFO] Continuation mode enabled")
         safe_print(f"[INFO] Will load model from: {args.model_path}")
 
-    # Set random seeds for reproducibility
+    # Set random seeds
     np.random.seed(42)
     torch.manual_seed(42)
 

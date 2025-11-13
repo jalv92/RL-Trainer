@@ -361,7 +361,7 @@ def select_market_for_training(markets, safe_print_func=print):
     Returns:
         Tuple of (selected market dict, MarketSpecification object), or (None, None) if cancelled
     """
-    from src.market_specs import get_market_spec
+    from market_specs import get_market_spec
 
     if not markets:
         safe_print_func("\n[ERROR] No market data files found!")

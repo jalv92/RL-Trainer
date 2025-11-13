@@ -10,14 +10,15 @@ Goal: Learn HOW to dynamically manage risk and optimize positions
 Based on: OpenAI Spinning Up PPO + Transfer Learning + Advanced RL
 """
 
+import math
 import numpy as np
 import pandas as pd
 from typing import Tuple, Dict, Optional
 import gymnasium as gym
 from gymnasium import spaces
 from datetime import datetime
-from src.environment_phase1 import TradingEnvironmentPhase1
-from src.market_specs import MarketSpecification
+from environment_phase1 import TradingEnvironmentPhase1
+from market_specs import MarketSpecification
 
 
 class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
@@ -88,13 +89,24 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         # RL FIX #10: Reduced from 9 to 6 for improved sample efficiency
         self.action_space = spaces.Discrete(6)
 
+        # ACTION MASKING FIX: Override observation space to include validity features
+        # Original: (window_size * 11 + 5,) = (225,)
+        # Updated: (window_size * 11 + 5 + 3,) = (228,)
+        # Added features: [can_enter_trade, can_manage_position, has_position]
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(window_size * 11 + 8,),  # 220 market + 5 position + 3 validity = 228
+            dtype=np.float32
+        )
+
         # Phase 2 position management parameters
         self.tighten_step_atr = tighten_sl_step
         self.extend_step_atr = extend_tp_step
         self.trail_activation_r = trailing_activation_profit
 
         # NEW: Dynamic position sizing parameters
-        self.max_position_size = position_size_contracts
+        self.max_position_size = int(self.position_size)
         self.position_scaling_enabled = True
         self.volatility_adjustment = True
 
@@ -111,6 +123,12 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         # Diagnostics
         self.last_action_mask = None
         self.last_done_reason = None
+
+        # Phase 2: Disable profit target (not used in Phase 2)
+        self.enable_profit_target = False
+        self.profit_target = None
+        self.profit_target_reached = False
+        self.profit_target_reached_step = None
 
 
     def reset(self, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
@@ -144,6 +162,73 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         # No need to re-assign them here
 
         return obs, info
+
+    def _get_observation(self) -> np.ndarray:
+        """
+        Override parent's _get_observation() to add 3 explicit validity features.
+
+        ACTION MASKING FIX: Added explicit validity features to help model learn
+        when actions are valid. This makes the action masking rules obvious to the network.
+
+        Returns:
+            np.ndarray: Shape (228,) = 220 market + 5 position + 3 validity
+                Market features (220): Same as Phase 1
+                Position features (5): [position, entry_price_ratio, sl_distance_atr, tp_distance_atr, time_in_position]
+                Validity features (3): [can_enter_trade, can_manage_position, has_position]
+        """
+        # Get parent's observation (225 features)
+        parent_obs = super()._get_observation()
+
+        # Calculate validity features
+        current_time = self.data.index[self.current_step]
+        if current_time.tzinfo is None:
+            ts = current_time.tz_localize('UTC').tz_convert('America/New_York')
+        else:
+            ts = current_time.tz_convert('America/New_York')
+
+        rth_open = ts.replace(hour=9, minute=30, second=0)
+        rth_close = ts.replace(hour=16, minute=59, second=0)
+        in_rth = (ts >= rth_open) and (ts <= rth_close) and self.allow_new_trades
+
+        # Validity features make action masking rules explicit to the network
+        can_enter_trade = float(self.position == 0 and in_rth)  # Can use BUY/SELL
+        can_manage_position = float(self.position != 0)         # Can use PM actions
+        has_position = float(self.position != 0)                 # Has open position
+
+        validity_features = np.array([
+            can_enter_trade,
+            can_manage_position,
+            has_position
+        ], dtype=np.float32)
+
+        # Combine parent observation + validity features
+        full_observation = np.concatenate([parent_obs, validity_features])
+
+        return full_observation.astype(np.float32)
+
+    def _calculate_apex_reward(self, position_changed, exit_reason, trade_pnl, portfolio_value, pm_action_taken):
+        """Calculate Apex-optimized reward."""
+        reward = 0.0
+        
+        # Base reward for position management actions
+        if pm_action_taken:
+            if 'move_to_be' in pm_action_taken:
+                reward += 0.1  # Small positive for risk management
+            elif 'enable_trail' in pm_action_taken:
+                reward += 0.05  # Small positive for trailing
+        
+        # Trade completion reward
+        if exit_reason:
+            if trade_pnl > 0:
+                reward += 1.0  # Win
+            else:
+                reward -= 0.5  # Loss
+        
+        # Portfolio value reward (shaped)
+        if portfolio_value > self.initial_balance:
+            reward += (portfolio_value - self.initial_balance) / 10000.0
+        
+        return reward
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
@@ -188,6 +273,36 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         trade_pnl = 0.0
         exit_reason = None
         pm_action_taken = None  # Position management action
+
+        # ============================================================
+        # 0. EARLY INVALID ACTION CHECK (ACTION MASKING FIX)
+        # ============================================================
+        # Check if action is invalid BEFORE processing
+        # This provides strong immediate feedback and prevents wasted computation
+        action_mask = self.action_masks()
+        if not action_mask[action]:
+            # Invalid action detected - apply strong penalty and return immediately
+            # CRITICAL: Advance time even for invalid actions (prevents exploitation)
+            self.current_step += 1
+
+            reward = -1.0
+            obs = self._get_observation()
+
+            # Check if episode ended after time advance
+            truncated = self.current_step >= len(self.data) - 1
+
+            info = {
+                'portfolio_value': self.balance,
+                'position': self.position,
+                'invalid_action': True,
+                'action': action,
+                'action_mask': action_mask.tolist(),
+                'reason': f"Action {action} invalid for position={self.position}",
+                'balance': self.balance,
+                'step_index': self.current_step,
+            }
+            # DO NOT execute invalid action - return current state (but time advanced)
+            return obs, reward, False, truncated, info
 
         # ============================================================
         # 1. UPDATE TRAILING STOP (if active)
@@ -287,7 +402,8 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                     pm_action_taken = "move_to_be"
                     self.be_move_count += 1
             else:
-                reward -= 0.01
+                # ACTION MASKING FIX: Increased penalty from -0.01 to -1.0
+                reward -= 1.0
                 pm_action_taken = f"invalid_move_to_be: {reason}"
 
         elif action == self.ACTION_ENABLE_TRAIL and self.position != 0:
@@ -302,7 +418,8 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                     # Already enabled - no-op but not an error
                     pm_action_taken = "trail_already_on"
             else:
-                reward -= 0.01
+                # ACTION MASKING FIX: Increased penalty from -0.01 to -1.0
+                reward -= 1.0
                 pm_action_taken = f"invalid_enable_trail: {reason}"
 
         elif action == self.ACTION_DISABLE_TRAIL and self.position != 0:
@@ -317,7 +434,8 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                     # Already disabled - no-op but not an error
                     pm_action_taken = "trail_already_off"
             else:
-                reward -= 0.01
+                # ACTION MASKING FIX: Increased penalty from -0.01 to -1.0
+                reward -= 1.0
                 pm_action_taken = f"invalid_disable_trail: {reason}"
 
         # ============================================================
@@ -338,7 +456,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         self.portfolio_values.append(portfolio_value)
 
         # APEX RITHMIC RULE: Stop trailing when profit target reached
-        if portfolio_value >= self.profit_target and not self.profit_target_reached:
+        if self.profit_target is not None and portfolio_value >= self.profit_target and not self.profit_target_reached:
             self.profit_target_reached = True
             self.profit_target_reached_step = self.current_step
             self.trailing_stopped = True
@@ -508,7 +626,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         This implements volatility-adjusted position sizing from the improvement plan.
 
         Returns:
-            float: Adjusted position size (between 0 and max_position_size)
+            int: Adjusted position size (integer contracts, min 1)
         """
         if not self.position_scaling_enabled:
             return self.max_position_size
@@ -526,16 +644,18 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             vol_ratio = current_atr / avg_atr
 
             # Reduce size in high volatility (vol_ratio > 1)
-            # When volatility is 2x normal, size becomes 0.5x max
+            # When volatility is 2x normal, the multiplier halves
             # Formula: size = max_size / (1 + vol_ratio)
             size_multiplier = 1.0 / (1.0 + max(0, vol_ratio - 1.0))
 
-            # Ensure we don't go below 50% of max size (always trade something)
+            # Ensure multiplier never collapses completely
             size_multiplier = max(0.5, size_multiplier)
         else:
             size_multiplier = 1.0
 
-        return self.max_position_size * size_multiplier
+        target_size = self.max_position_size * size_multiplier
+        adjusted_size = max(1, math.floor(target_size))
+        return adjusted_size
 
     def _reset_position_state(self):
         """Reset position and management state after exit."""
@@ -596,6 +716,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
 
         RL FIX #4: Action masking prevents wasted exploration on invalid actions.
         RL FIX #10: Updated for simplified 6-action space.
+        RL FIX #11: Enhanced position management dependencies - ENABLE_TRAIL requires BE first.
 
         Returns:
             np.ndarray: Boolean mask of shape (6,) where True = valid action
@@ -639,17 +760,27 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
 
             unrealized_pnl = self._calculate_unrealized_pnl(current_price)
 
-            # Move to BE: only if profitable and not already at BE
+            # RL FIX #11: Check if SL is at or past break-even
+            # This enforces logical sequence: Move to BE → THEN enable trailing
+            sl_at_or_past_be = False
+            if self.position == 1:
+                sl_at_or_past_be = (self.sl_price >= self.entry_price)
+            else:
+                sl_at_or_past_be = (self.sl_price <= self.entry_price)
+
+            # Move to BE: only if profitable and NOT already at BE
             if unrealized_pnl > 0:
-                if self.position == 1:
-                    mask[3] = self.sl_price < self.entry_price
-                else:
-                    mask[3] = self.sl_price > self.entry_price
+                mask[3] = not sl_at_or_past_be  # Can move if NOT at BE yet
             else:
                 mask[3] = False
 
-            # Enable trailing: only if profitable and not already enabled
-            mask[4] = (unrealized_pnl > 0) and (not self.trailing_stop_active)
+            # RL FIX #11: Enable trailing requires BE protection first
+            # Prevents suboptimal sequence: Trail → BE (should be BE → Trail)
+            mask[4] = (
+                (unrealized_pnl > 0) and
+                (not self.trailing_stop_active) and
+                sl_at_or_past_be  # NEW: Must secure BE before trailing
+            )
 
             # Disable trailing: only if currently enabled
             mask[5] = self.trailing_stop_active

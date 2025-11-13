@@ -72,13 +72,90 @@ def add_market_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     if 'session_morning' in df.columns:
         print("  [OK] Session features added")
 
-    # 6. Fill NaN values (from rolling windows)
+    # 6. LLM features for Phase 3
+    df = add_llm_features(df)
+    print("  [OK] LLM features added")
+
+    # 7. Fill NaN values (from rolling windows)
     # Forward fill then backward fill to handle initial NaNs
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     df[numeric_cols] = df[numeric_cols].ffill().bfill().fillna(0)
 
     print(f"[FEATURES] Total features: {len(df.columns)}")
     return df
+
+
+def add_llm_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add multi-timeframe and pattern features for LLM-enhanced trading.
+    
+    These features provide additional context for the LLM advisor:
+    - Multi-timeframe SMAs and RSI
+    - Volume analysis across timeframes
+    - Support/resistance levels
+    - Price change metrics
+    
+    Args:
+        df: DataFrame with OHLCV and basic indicators
+        
+    Returns:
+        DataFrame with additional LLM features
+    """
+    print("  [LLM] Adding multi-timeframe and pattern features...")
+    
+    # Multi-timeframe SMAs
+    if 'close' in df.columns:
+        df['sma_50'] = df['close'].rolling(50).mean()
+        df['sma_200'] = df['close'].rolling(200).mean()
+        print("    [OK] Multi-timeframe SMAs added")
+    
+    # Multi-timeframe RSI (using different periods)
+    if 'close' in df.columns:
+        # RSI with 15-period (faster)
+        df['rsi_15min'] = calculate_rsi(df['close'], period=15)
+        # RSI with 60-period (slower)
+        df['rsi_60min'] = calculate_rsi(df['close'], period=60)
+        print("    [OK] Multi-timeframe RSI added")
+    
+    # Volume analysis across timeframes
+    if 'volume' in df.columns:
+        df['volume_ratio_5min'] = df['volume'] / df['volume'].rolling(5).mean()
+        df['volume_ratio_20min'] = df['volume'] / df['volume'].rolling(20).mean()
+        print("    [OK] Volume ratio features added")
+    
+    # Support and Resistance levels
+    if 'high' in df.columns and 'low' in df.columns:
+        df['support_20'] = df['low'].rolling(20).min()
+        df['resistance_20'] = df['high'].rolling(20).max()
+        print("    [OK] Support/Resistance levels added")
+    
+    # Price change metrics
+    if 'close' in df.columns:
+        df['price_change_60min'] = df['close'].pct_change(60)
+        print("    [OK] Price change metrics added")
+    
+    return df
+
+
+def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Calculate Relative Strength Index (RSI).
+    
+    Args:
+        prices: Price series
+        period: RSI period
+        
+    Returns:
+        RSI values (0-100)
+    """
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    
+    rs = gain / (loss + 1e-8)
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
 
 
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
