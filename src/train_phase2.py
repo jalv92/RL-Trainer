@@ -35,6 +35,7 @@ import glob
 import torch
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 _TORCH_THREADS_OVERRIDE = os.environ.get("PYTORCH_NUM_THREADS")
 try:
@@ -51,13 +52,21 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, CallbackList
 from environment_phase2 import TradingEnvironmentPhase2
 from kl_callback import KLDivergenceCallback
 from feature_engineering import add_market_regime_features
 from model_utils import detect_models_in_folder, detect_available_markets, select_market_for_training
 from market_specs import get_market_spec
 from metadata_utils import read_metadata, write_metadata
+from action_mask_utils import get_action_masks, ensure_vecenv_action_masks
+
+# CHECKPOINT MANAGEMENT
+from checkpoint_manager import DynamicCheckpointManager, MetricTrackingEvalCallback, EvalMetricHook
+from checkpoint_retention import CheckpointRetentionManager
+
+# SELF-CORRECTING SYSTEM
+from self_correcting_init import init_self_correcting_system
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -169,6 +178,11 @@ PHASE2_CONFIG = {
     'trailing_dd_limit': 2500,  # Strict Apex rules ($5k in Phase 1)
     'tighten_sl_step': 0.5,
     'extend_tp_step': 1.0,
+    'min_episode_bars': 600,  # Short episodes (20% of training) - reduced for variety
+    'long_episode_min_bars': 2000,  # CRITICAL FIX: Long episodes (80%) - match eval horizon (327-1846 bars)
+    'randomize_start_offsets': True,
+    'deterministic_env_offsets': False,
+    'start_offset_seed': 23,
 
     # Market specifications (optional override)
     'commission_override': None,  # None = use market default, or set custom value (e.g., 1.50)
@@ -234,6 +248,25 @@ def get_learning_rate(config):
             config["total_timesteps"]
         )
     return learning_rate
+
+
+def compute_env_start_index(data_length: int, config: dict, env_id: int) -> int:
+    """Helper to compute deterministic episode start when randomization disabled."""
+    min_start = config.get('window_size', 20)
+    min_episode_bars = max(config.get('min_episode_bars', 1500), 10)
+    max_start = data_length - min_episode_bars
+    if max_start <= min_start:
+        return min_start
+
+    if config.get('deterministic_env_offsets', False):
+        n_envs = max(1, config.get('num_envs', 1))
+        spacing = max(1, (max_start - min_start) // n_envs or 1)
+        start = min_start + spacing * env_id
+        return min(max(start, min_start), max_start)
+
+    seed = config.get('start_offset_seed')
+    rng = np.random.default_rng(seed + env_id if seed is not None else None)
+    return int(rng.integers(min_start, max_start + 1))
 
 
 
@@ -473,78 +506,73 @@ def mask_fn(env):
     Returns:
         np.ndarray: Boolean mask where True = valid action
     """
-    return env.action_masks()
+    return get_action_masks(env)
 
 
 def make_env(data, second_data, env_id, config, market_spec):
     """
-    Create Phase 2 environment factory with random episode starts to prevent temporal leakage.
+    Create Phase 2 environment factory with mixed episode lengths.
 
-    RL FIX #3: Removed fixed env_id-based seeding to eliminate temporal correlation.
-    Each environment now samples truly random episodes on every reset.
+    IMPROVEMENT: 80% long-form episodes (like evaluation) + 20% short randomized
+    This fixes the train/eval distribution mismatch.
 
-    ACTION MASKING FIX: Now wraps environment with ActionMasker before Monitor.
+    Long episodes: Deterministic start, run to completion (like evaluation)
+    Short episodes: Random start, standard min_episode_bars
+
+    ACTION MASKING FIX: Ensures ActionMasker is the outermost wrapper so MaskablePPO can
+    access action masks without deprecated wrapper traversal.
     """
     def _init():
-        # Calculate episode parameters
-        episode_length = config.get('episode_length', 390)  # 1 trading day
-        window_size = config['window_size']
+        # CRITICAL FIX: 80% long-form episodes to match evaluation distribution
+        is_long_episode = (env_id % 5 != 0)  # 80% long (env 0,1,2,3 long, env 4 short)
 
-        # RL FIX #3: TRUE random start position (no fixed seeding)
-        # Previous: np.random.seed(env_id + 42) caused same episodes each run
-        # New: Use global random state - different episodes every time
-        max_start = len(data) - episode_length - window_size
-        if max_start <= window_size:
-            start_idx = window_size
+        if is_long_episode:
+            # LONG EPISODE MODE (like evaluation)
+            # CRITICAL FIX: Use randomized start to prevent overfitting to specific slices
+            # Previous implementation used deterministic env_id * 100 offsets,
+            # which meant each worker replayed the same slice forever (only 64 unique sequences)
+            start_idx = None  # Let environment choose randomly
+            randomize = True  # FIXED: Randomize to prevent overfitting
+            min_bars = config.get('long_episode_min_bars', 500)  # Configurable, default 500-2000 range
         else:
-            # NO SEEDING - use global random state for true randomization
-            # This prevents temporal overfitting and improves generalization
-            start_idx = np.random.randint(0, max_start)
-
-        end_idx = start_idx + episode_length
-
-        # Extract episode data - this creates independent episodes
-        env_data = data.iloc[start_idx:end_idx].copy()
-
-        # Filter second-level data for this episode
-        env_second_data = None
-        if second_data is not None:
-            start_time = data.index[start_idx]
-            end_time = data.index[end_idx-1]
-            mask = (second_data.index >= start_time) & (second_data.index < end_time)
-            env_second_data = second_data[mask].copy()
-
-        if env_id == 0:
-            safe_print(f"[ENV] Env {env_id}: Random start at index {start_idx}, "
-                  f"period {data.index[start_idx]} to {data.index[end_idx-1]}")
-            safe_print(f"[ENV] Episode length: {len(env_data)} bars")
-            safe_print(f"[ENV] Data range: {len(data)} total bars, using episodes of {episode_length}")
-            safe_print(f"[ENV] RL FIX #3: Using true random sampling (no fixed seeding)")
-            if env_second_data is not None:
-                safe_print(f"[ENV] Second-level data: {len(env_second_data)} bars")
+            # SHORT EPISODE MODE (20% for robustness)
+            start_idx = None
+            randomize = True  # Randomized start
+            min_bars = config.get('min_episode_bars', 1500)
 
         env = TradingEnvironmentPhase2(
-            data=env_data,
+            data=data,
             window_size=config['window_size'],
             initial_balance=config['initial_balance'],
-            second_data=env_second_data,  # Pass second-level data
-            market_spec=market_spec,  # NEW: Pass market spec
-            commission_override=config.get('commission_override', None),  # NEW: Optional override
+            second_data=second_data,
+            market_spec=market_spec,
+            commission_override=config.get('commission_override', None),
             initial_sl_multiplier=config['initial_sl_multiplier'],
             initial_tp_ratio=config['initial_tp_ratio'],
             position_size_contracts=config['position_size'],
             trailing_drawdown_limit=config['trailing_dd_limit'],
             tighten_sl_step=config['tighten_sl_step'],
-            extend_tp_step=config['extend_tp_step']
+            extend_tp_step=config['extend_tp_step'],
+            start_index=start_idx,
+            randomize_start_offsets=randomize,
+            min_episode_bars=min_bars
         )
 
-        # ACTION MASKING FIX: Wrap environment with ActionMasker BEFORE Monitor
-        # This is critical - ActionMasker must wrap the base environment so that
-        # MaskablePPO can call action_masks() during training
-        env = ActionMasker(env, mask_fn)
+        # Validation: Ensure environment has randomization support
+        assert hasattr(env, 'randomize_start_offsets'), \
+            "Environment missing randomization support"
+        assert hasattr(env, 'min_episode_bars'), \
+            "Environment missing min_episode_bars attribute"
+        assert hasattr(env, '_determine_episode_start'), \
+            "Environment missing _determine_episode_start method"
 
-        # Then wrap with Monitor for episode statistics
-        return Monitor(env)
+        # Wrap with Monitor first for stats/loss tracking
+        env = Monitor(env)
+
+        # IMPORTANT: ActionMasker must be the outermost wrapper so SB3's
+        # env.get_wrapper_attr('action_masks') finds it without hitting the
+        # deprecated env.action_masks traversal.
+        return ActionMasker(env, mask_fn)
 
     return _init
 
@@ -645,10 +673,39 @@ def load_phase1_and_transfer(config, env):
 
     target_market = config.get('target_market')
 
+    # CRITICAL FIX: Check model compatibility before loading
+    from pipeline.phase_guard import PhaseGuard
+    compatible, compat_msg = PhaseGuard.check_model_compatibility(phase1_path, phase2_env_obs_space=228)
+    if not compatible:
+        raise RuntimeError(f"Phase 1 model incompatible with Phase 2: {compat_msg}")
+    safe_print(f"[TRANSFER] {compat_msg}")
+
     try:
-        # Load Phase 1 model (3 actions)
-        phase1_model = PPO.load(phase1_path, device=config['device'])
-        safe_print("[TRANSFER] [OK] Phase 1 model loaded")
+        # CRITICAL FIX: Load Phase 1 MaskablePPO model (not PPO)
+        # Phase 1 uses MaskablePPO, so we must use MaskablePPO.load()
+        # Add custom_objects to handle incompatible parameters
+        try:
+            phase1_model = MaskablePPO.load(
+                phase1_path,
+                device=config['device'],
+                custom_objects={
+                    'use_sde': False,  # Handle incompatible SDE args
+                    'clip_range_vf': None,  # Handle optional vf clipping
+                    'target_kl': None,  # Handle optional KL target
+                }
+            )
+            safe_print("[TRANSFER] [OK] Phase 1 MaskablePPO model loaded")
+        except TypeError as te:
+            # If custom_objects still fails, try without it and let SB3 handle defaults
+            safe_print(f"[TRANSFER] [WARN] Custom objects failed ({te}), trying default load...")
+            phase1_model = MaskablePPO.load(phase1_path, device=config['device'])
+            safe_print("[TRANSFER] [OK] Phase 1 MaskablePPO model loaded (default parameters)")
+        except Exception as load_err:
+            raise RuntimeError(
+                f"Failed to load Phase 1 model from {phase1_path}: {load_err}\n"
+                f"Remediation: Ensure Phase 1 was trained with MaskablePPO and saved correctly.\n"
+                f"If using an old model, retrain Phase 1 with the current codebase."
+            )
 
         phase1_meta = read_metadata(phase1_path)
         if phase1_meta:
@@ -819,7 +876,53 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
     Args:
         market_override: Optional market symbol to use (ES, NQ, etc.). If None, will prompt interactively.
         non_interactive: If True, run in non-interactive mode (no prompts, use defaults)
+        test_mode: If True, skip PhaseGuard for quick testing
     """
+    # Import PhaseGuard at function level (used multiple times)
+    from pipeline.phase_guard import PhaseGuard, print_gate_banner
+
+    # PHASE GUARD: Validate Phase 1 completion before proceeding
+    if not test_mode:  # Skip gate in test mode for quick iteration
+
+        safe_print("\n" + "=" * 80)
+        safe_print("PHASE GUARD: Validating Phase 1 Completion")
+        safe_print("=" * 80 + "\n")
+
+        # CRITICAL FIX: Detect Phase 1 model path for metadata-based test detection
+        phase1_model_path = PHASE2_CONFIG['phase1_model_path']
+        if not os.path.exists(phase1_model_path):
+            # Auto-detect newest Phase 1 model
+            from model_utils import detect_models_in_folder
+            phase1_models = detect_models_in_folder(phase='phase1')
+            if phase1_models:
+                phase1_model_path = phase1_models[0]['path']
+                safe_print(f"[GUARD] Auto-detected Phase 1 model: {phase1_models[0]['name']}")
+            else:
+                phase1_model_path = None
+                safe_print("[GUARD] WARNING: No Phase 1 model found for metadata check")
+
+        # Pass model_path so metadata-based test detection runs
+        passed, message, metrics = PhaseGuard.validate_phase1(model_path=phase1_model_path)
+        safe_print(message)
+
+        if not passed:
+            print_gate_banner(False, "Phase 1")
+            safe_print("\n⛔ PHASE 2 TRAINING BLOCKED\n")
+            safe_print("Recommendations:")
+            safe_print("  1. Retrain Phase 1 with increased timesteps (10M)")
+            safe_print("  2. Ensure mean_reward > 0.0 in evaluation")
+            safe_print("  3. Check logs/phase1/evaluations.npz for details")
+            safe_print("\nTo override (NOT recommended):")
+            safe_print("  Edit train_phase2.py and set override=True in PhaseGuard.validate_phase1()")
+
+            # Log gate decision
+            PhaseGuard.log_gate_decision('phase1', False, message, metrics)
+            return
+
+        print_gate_banner(True, "Phase 1")
+        PhaseGuard.log_gate_decision('phase1', True, message, metrics)
+        safe_print("\n✅ Proceeding to Phase 2 training...\n")
+
     safe_print("=" * 80)
     safe_print("PHASE 2: POSITION MANAGEMENT MASTERY")
     safe_print("=" * 80)
@@ -891,23 +994,33 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
         env = DummyVecEnv(env_fns)
 
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+    env = ensure_vecenv_action_masks(env)
     safe_print("[ENV] [OK] Phase 2 training environments created")
 
     # Create VALIDATION environment (use VAL data - CRITICAL FIX)
     safe_print("[EVAL] Creating VALIDATION environment (unseen data)...")
-    eval_env = DummyVecEnv([lambda: Monitor(TradingEnvironmentPhase2(
-        data=val_data,  # CHANGED: Use validation data
-        window_size=PHASE2_CONFIG['window_size'],
-        initial_balance=PHASE2_CONFIG['initial_balance'],
-        second_data=val_second_data,  # CHANGED: Use val second-level data
-        market_spec=market_spec,  # NEW: Pass market spec
-        commission_override=PHASE2_CONFIG.get('commission_override', None),  # NEW
-        initial_sl_multiplier=PHASE2_CONFIG['initial_sl_multiplier'],
-        initial_tp_ratio=PHASE2_CONFIG['initial_tp_ratio'],
-        position_size_contracts=PHASE2_CONFIG['position_size'],
-        trailing_drawdown_limit=PHASE2_CONFIG['trailing_dd_limit']
-    ))])
+    def _make_eval_env():
+        base_env = TradingEnvironmentPhase2(
+            data=val_data,  # CHANGED: Use validation data
+            window_size=PHASE2_CONFIG['window_size'],
+            initial_balance=PHASE2_CONFIG['initial_balance'],
+            second_data=val_second_data,  # CHANGED: Use val second-level data
+            market_spec=market_spec,  # NEW: Pass market spec
+            commission_override=PHASE2_CONFIG.get('commission_override', None),  # NEW
+            initial_sl_multiplier=PHASE2_CONFIG['initial_sl_multiplier'],
+            initial_tp_ratio=PHASE2_CONFIG['initial_tp_ratio'],
+            position_size_contracts=PHASE2_CONFIG['position_size'],
+            trailing_drawdown_limit=PHASE2_CONFIG['trailing_dd_limit'],
+            start_index=PHASE2_CONFIG['window_size'],
+            randomize_start_offsets=False,
+            min_episode_bars=PHASE2_CONFIG.get('min_episode_bars', 1500)
+        )
+        monitored_env = Monitor(base_env)
+        return ActionMasker(monitored_env, mask_fn)
+
+    eval_env = DummyVecEnv([_make_eval_env])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    eval_env = ensure_vecenv_action_masks(eval_env)
     # Transfer learning from Phase 1
     model = load_phase1_and_transfer(PHASE2_CONFIG, env)
 
@@ -962,28 +1075,69 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
         early_stop_callback = None
         safe_print("[TRAIN] Early stopping disabled")
 
+    # IMPROVEMENT: Add timestamp to evaluation logs to prevent overwriting
+    eval_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    eval_log_path = f'./logs/phase2/eval_{eval_timestamp}'
+    os.makedirs(eval_log_path, exist_ok=True)
+
+    safe_print(f"[EVAL] Evaluation logs will be saved to: {eval_log_path}")
+
+    # Initialize self-correcting system from configuration
+    registry, forecaster, metric_tracker, policy_controller, corrective_manager = init_self_correcting_system(
+        market=market_name,
+        phase=2,
+        config_path='config/checkpoint_config.yaml',
+        verbose=True
+    )
+
+    # Set seed for metric tracker
+    metric_tracker.set_seed(42)  # Match training seed
+
+    # Create metric hook to update tracker after each evaluation
+    metric_hook = EvalMetricHook(metric_tracker)
+
+    # Combine early stopping and metric tracking using CallbackList
+    # If early_stop_callback is None, only use metric_hook
+    if early_stop_callback is not None:
+        after_eval_callback = CallbackList([early_stop_callback, metric_hook])
+    else:
+        after_eval_callback = metric_hook
+
     eval_callback = EvalCallback(
         eval_env,
         eval_freq=PHASE2_CONFIG['eval_freq'],
         n_eval_episodes=PHASE2_CONFIG['n_eval_episodes'],
         best_model_save_path='./models/phase2/',
-        log_path='./logs/phase2/',
+        log_path=eval_log_path,  # IMPROVEMENT: Versioned log path
         deterministic=True,
         render=False,
         verbose=1,
-        callback_after_eval=early_stop_callback  # Pass early stopping here
+        callback_after_eval=after_eval_callback
     )
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=100_000,
-        save_path='./models/phase2/checkpoints/',
-        name_prefix='phase2',
-        save_replay_buffer=False,
-        save_vecnormalize=True
+    # IMPROVED: Dynamic checkpoint manager with adaptive intervals and event-driven saves
+    checkpoint_manager = DynamicCheckpointManager(
+        market=market_name,
+        phase=2,
+        seed=42,
+        config_path='config/checkpoint_config.yaml',
+        metric_tracker=metric_tracker,
+        target_timesteps=PHASE2_CONFIG['total_timesteps'],
+        verbose=True,
+        registry=registry  # Connect to global registry
     )
+    safe_print(f"[CHECKPOINT] Dynamic checkpoint manager initialized")
+    safe_print(f"[CHECKPOINT] Base interval: 50K steps (adaptive)")
+    safe_print(f"[CHECKPOINT] Event triggers: periodic, best, phase_end, interrupt")
 
-    # NEW: KL divergence monitoring callback
-    callbacks = [eval_callback, checkpoint_callback]  # Don't add early_stop separately
+    # Build callbacks list (order matters: eval -> checkpoint -> controller -> corrective)
+    callbacks = [eval_callback, checkpoint_manager]
+
+    # Add optional self-correcting callbacks (if enabled in config)
+    if policy_controller is not None:
+        callbacks.append(policy_controller)
+    if corrective_manager is not None:
+        callbacks.append(corrective_manager)
     
     if PHASE2_CONFIG.get('use_kl_callback', False):
         kl_callback = KLDivergenceCallback(
@@ -1024,14 +1178,32 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
             callback=callbacks,
             progress_bar=use_progress_bar
         )
+        # Save phase_end checkpoint after successful training
+        checkpoint_manager.on_phase_end()
     except KeyboardInterrupt:
         safe_print("\n[TRAIN] Training interrupted by user")
-        safe_print("[TRAIN] Saving current model state...")
+        safe_print("[TRAIN] Saving interrupt checkpoint...")
+        checkpoint_manager.on_interrupt()
     except Exception as e:
         safe_print(f"\n[ERROR] Training failed: {e}")
+        # Save interrupt checkpoint on exception
+        try:
+            checkpoint_manager.on_interrupt()
+        except Exception:
+            pass
         raise
 
     elapsed = time.time() - start_time
+
+    # Run checkpoint retention cleanup
+    safe_print("\n[CHECKPOINT] Running checkpoint retention cleanup...")
+    try:
+        retention_manager = CheckpointRetentionManager('config/checkpoint_config.yaml')
+        checkpoint_dir = f'./models/phase2/{market_name}/checkpoints/'
+        retention_manager.prune_checkpoints(checkpoint_dir, dry_run=False, verbose=False)
+        safe_print("[CHECKPOINT] Retention cleanup completed")
+    except Exception as e:
+        safe_print(f"[WARNING] Checkpoint retention cleanup failed: {e}")
 
     # Save final model
     safe_print("\n[SAVE] Saving final Phase 2 model...")
@@ -1056,6 +1228,12 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
 
     write_metadata(final_model_base, {**metadata_common, 'artifact': 'model'})
     write_metadata(final_vecnorm_path, {**metadata_common, 'artifact': 'vecnormalize'})
+
+    # CRITICAL FIX: Create legacy symlink for backward compatibility
+    # This allows PhaseGuard and other tools to find evaluation results at the legacy path
+    legacy_path = PhaseGuard.create_legacy_symlink('logs/phase2', use_copy=False)
+    if legacy_path:
+        safe_print(f"[COMPAT] Created legacy evaluation link: {legacy_path}")
 
     safe_print("\n" + "=" * 80)
     safe_print("PHASE 2 TRAINING COMPLETE!")

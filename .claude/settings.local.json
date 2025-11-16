@@ -30,7 +30,11 @@
       "Bash(timeout 60 python3:*)",
       "Bash(tee:*)",
       "Bash(dmesg:*)",
-      "Bash(timeout 180 python3:*)"
+      "Bash(timeout 180 python3:*)",
+      "Bash(PYTHONPATH=\"/mnt/c/Users/javlo/Documents/Code Projects/RL Trainner & Executor System/AI Trainer/src:$PYTHONPATH\" python3:*)",
+      "Bash(pip show:*)",
+      "WebSearch",
+      "Bash(mkdir:*)"
     ],
     "deny": [],
     "ask": []

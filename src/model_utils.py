@@ -9,11 +9,44 @@ import os
 import glob
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 import torch
 from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.vec_env import VecNormalize
+
+from metadata_utils import read_metadata
+
+
+def resolve_learning_rate(lr_attr: Any, progress: float = 1.0) -> Optional[float]:
+    """
+    Safely resolve a learning rate attribute to a float value.
+
+    Handles constant floats, numpy/tensor scalars, or callable schedules that
+    expect a progress value (0.0–1.0). Returns None when the rate cannot be
+    evaluated.
+    """
+    if lr_attr is None:
+        return None
+
+    # Callables (e.g., SB3 schedules) may expect a progress argument
+    if callable(lr_attr):
+        for arg in (progress,):
+            try:
+                return float(lr_attr(arg))
+            except TypeError:
+                continue
+            except Exception:
+                return None
+        try:
+            return float(lr_attr())
+        except Exception:
+            return None
+
+    try:
+        return float(lr_attr)
+    except (TypeError, ValueError):
+        return None
 
 
 def detect_models_in_folder(model_dir: str = 'models', phase: Optional[str] = None) -> List[Dict]:
@@ -56,16 +89,21 @@ def detect_models_in_folder(model_dir: str = 'models', phase: Optional[str] = No
 
         # Determine model type from path or name
         model_type = None
-        if 'phase1' in model_path.lower():
-            model_type = 'phase1'
-        elif 'phase2' in model_path.lower():
+        path_lower = model_path.lower()
+        if 'phase3' in path_lower or 'hybrid' in path_lower:
+            model_type = 'phase3'
+        elif 'phase2' in path_lower:
             model_type = 'phase2'
+        elif 'phase1' in path_lower:
+            model_type = 'phase1'
         else:
             # Try to infer from directory structure
             if 'phase1' in str(path_obj.parent):
                 model_type = 'phase1'
             elif 'phase2' in str(path_obj.parent):
                 model_type = 'phase2'
+            elif 'phase3' in str(path_obj.parent):
+                model_type = 'phase3'
 
         # Skip if we're filtering by phase and this doesn't match
         if phase and model_type != phase:
@@ -84,6 +122,10 @@ def detect_models_in_folder(model_dir: str = 'models', phase: Optional[str] = No
                 vecnorm_path = candidate
                 break
 
+        metadata = None
+        metadata_path = model_path[:-4] if model_path.lower().endswith('.zip') else model_path
+        metadata = read_metadata(metadata_path)
+
         models.append({
             'path': model_path,
             'name': name,
@@ -91,7 +133,10 @@ def detect_models_in_folder(model_dir: str = 'models', phase: Optional[str] = No
             'size_mb': size_mb,
             'modified': modified_dt,
             'modified_str': modified_dt.strftime('%Y-%m-%d %H:%M:%S'),
-            'vecnorm_path': vecnorm_path
+            'vecnorm_path': vecnorm_path,
+            'metadata': metadata,
+            'market': (metadata or {}).get('market'),
+            'phase': (metadata or {}).get('phase')
         })
 
     # Sort by modification time (newest first)
@@ -199,10 +244,24 @@ def display_model_selection(models: List[Dict], phase_filter: Optional[str] = No
     for i, model_info in enumerate(models, 1):
         type_label = model_info['type'].upper() if model_info['type'] != 'unknown' else 'UNKNOWN'
         vecnorm_status = "✓" if model_info['vecnorm_path'] else "✗"
+        metadata = model_info.get('metadata') or {}
+        market = metadata.get('market')
+        test_mode = metadata.get('test_mode')
+        timesteps = metadata.get('total_timesteps')
 
         print(f"\n{i}. {model_info['name']}")
         print(f"   Type: {type_label} | Size: {model_info['size_mb']:.2f} MB | VecNorm: {vecnorm_status}")
         print(f"   Modified: {model_info['modified_str']}")
+        if market or timesteps or test_mode is not None:
+            details = []
+            if market:
+                details.append(f"Market: {market}")
+            if timesteps:
+                details.append(f"Timesteps: {timesteps:,}")
+            if test_mode is not None:
+                details.append("Mode: TEST" if test_mode else "Mode: PROD")
+            if details:
+                print(f"   {' | '.join(details)}")
         print(f"   Path: {model_info['path']}")
 
     print("\n" + "="*70)

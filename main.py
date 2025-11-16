@@ -23,7 +23,7 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 # Import model utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
@@ -98,7 +98,8 @@ class RLTrainerMenu:
         self.training_menu_options = {
             "1": "Complete Training Pipeline (Test Mode)",
             "2": "Complete Training Pipeline (Production Mode)",
-            "3": "Back to Main Menu"
+            "3": "Continue Training from Existing Model",
+            "4": "Back to Main Menu"
         }
     
     def setup_logging(self):
@@ -296,14 +297,11 @@ class RLTrainerMenu:
         print(f"{Colors.BOLD}{Colors.CYAN}║                      TRAINING MENU                            ║{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
         print()
-
         for key, value in self.training_menu_options.items():
-            if key == "3":  # Back option
-                print(f"{Colors.YELLOW}  {key}. {value}{Colors.RESET}")
-            else:
-                print(f"{Colors.GREEN}  {key}. {value}{Colors.RESET}")
-
+            color = Colors.YELLOW if key == "4" else Colors.GREEN
+            print(f"{color}  {key}. {value}{Colors.RESET}")
         print()
+
     
     def get_user_input(self, prompt: str, valid_options: Optional[List[str]] = None) -> Optional[str]:
         """
@@ -695,6 +693,9 @@ class RLTrainerMenu:
                 self.run_complete_pipeline_production()
                 break
             elif choice == "3":
+                self.continue_training_from_model()
+                break
+            elif choice == "4":
                 print(f"{Colors.YELLOW}Returning to main menu...{Colors.RESET}")
                 break
             else:
@@ -836,7 +837,9 @@ class RLTrainerMenu:
                     print(f"{Colors.YELLOW}Phase 3 skipped. Pipeline completed through Phase 2.{Colors.RESET}")
                     return True
         except ImportError:
-            print(f"{Colors.YELLOW}⚠ PyTorch not available. Using mock LLM mode.{Colors.RESET}")
+            print(f"{Colors.YELLOW}⚠ PyTorch not available. Phase 3 requires PyTorch.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Pipeline completed through Phase 2 only.{Colors.RESET}")
+            return True
 
         phase3_script = self.src_dir / "train_phase3_llm.py"
         if not phase3_script.exists():
@@ -844,7 +847,8 @@ class RLTrainerMenu:
             print(f"{Colors.YELLOW}Pipeline completed through Phase 2 only.{Colors.RESET}")
             return True  # Not a failure, just Phase 3 not available
 
-        print(f"\n{Colors.CYAN}Training hybrid RL + LLM agent...{Colors.RESET}\n")
+        print(f"\n{Colors.CYAN}Training hybrid RL + LLM agent...{Colors.RESET}")
+        print(f"{Colors.YELLOW}Note: Phase 3 requires Phi-3-mini-4k-instruct model in project folder{Colors.RESET}\n")
 
         phase3_start = time.time()
         command = [
@@ -1036,7 +1040,8 @@ class RLTrainerMenu:
             print(f"{Colors.YELLOW}Pipeline completed through Phase 2 only.{Colors.RESET}")
             return True  # Not a failure, just Phase 3 not available
 
-        print(f"\n{Colors.CYAN}Training hybrid RL + LLM agent (5M timesteps)...{Colors.RESET}\n")
+        print(f"\n{Colors.CYAN}Training hybrid RL + LLM agent (5M timesteps)...{Colors.RESET}")
+        print(f"{Colors.YELLOW}Note: Phase 3 requires Phi-3-mini-4k-instruct model in project folder{Colors.RESET}\n")
 
         phase3_start = time.time()
         command = [
@@ -1080,23 +1085,143 @@ class RLTrainerMenu:
 
         return True
 
+    def continue_training_from_model(self):
+        """Continue Phase 1 or Phase 3 training from an existing checkpoint."""
+        print(f"\n{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}║           CONTINUE TRAINING FROM EXISTING MODEL              ║{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
+
+        models = detect_models_in_folder(str(self.project_dir / "models"))
+        if not models:
+            print(f"{Colors.RED}No models found in models/. Train a phase first.{Colors.RESET}")
+            return False
+
+        supported_models = [m for m in models if m['type'] in ('phase1', 'phase3')]
+        if not supported_models:
+            print(f"{Colors.RED}No Phase 1 or Phase 3 models available for continuation.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Train a model first or copy checkpoints into models/.{Colors.RESET}")
+            return False
+
+        selection = display_model_selection(supported_models)
+        if selection < 0:
+            print(f"{Colors.YELLOW}Continuation cancelled.{Colors.RESET}")
+            return False
+
+        selected_model = supported_models[selection]
+        model_type = selected_model.get('type', 'unknown')
+        metadata = selected_model.get('metadata') or {}
+
+        if model_type == 'phase1':
+            script_name = "train_phase1.py"
+            description = "Phase 1 Continuation"
+            log_file = "phase1_continue.log"
+        elif model_type == 'phase3':
+            script_name = "train_phase3_llm.py"
+            description = "Phase 3 Continuation"
+            log_file = "phase3_continue.log"
+        else:
+            print(f"{Colors.RED}Continuation not supported for model type: {model_type}{Colors.RESET}")
+            return False
+
+        script_path = self.src_dir / script_name
+        if not script_path.exists():
+            print(f"{Colors.RED}Training script missing: {script_path}{Colors.RESET}")
+            return False
+
+        print(f"\n{Colors.GREEN}Selected model: {selected_model['name']} ({model_type.upper()}){Colors.RESET}")
+
+        # Determine run mode (test vs production)
+        mode_choice = self.get_user_input(
+            f"{Colors.YELLOW}Run continuation in test mode (1) or production (2)? {Colors.RESET}",
+            ["1", "2"]
+        )
+        if mode_choice is None:
+            print(f"{Colors.YELLOW}Continuation cancelled.{Colors.RESET}")
+            return False
+        run_test = mode_choice == "1"
+
+        # Determine market symbol
+        market = metadata.get('market')
+        if market:
+            print(f"{Colors.CYAN}Detected market from metadata: {market}{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}Market metadata missing. Select a dataset to continue.{Colors.RESET}")
+            market = self.detect_and_select_market()
+            if not market:
+                print(f"{Colors.YELLOW}Continuation cancelled - market required.{Colors.RESET}")
+                return False
+        market = market.upper()
+
+        command = [
+            sys.executable,
+            str(script_path),
+            "--continue",
+            "--model-path",
+            selected_model['path'],
+            "--market",
+            market,
+            "--non-interactive"
+        ]
+
+        if run_test:
+            command.append("--test")
+
+        success, _ = self.run_command_with_progress(
+            command,
+            f"{description} ({'Test' if run_test else 'Production'} Mode)",
+            log_file
+        )
+
+        if success:
+            print(f"\n{Colors.GREEN}✓ Continuation completed successfully!{Colors.RESET}")
+        else:
+            print(f"\n{Colors.RED}✗ Continuation failed. Review logs/{log_file}.{Colors.RESET}")
+
+        return success
+
     def run_evaluation(self):
-        """Run model evaluation."""
+        """Evaluate the latest Phase 3 hybrid model on unseen data."""
         print(f"\n{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.CYAN}║                         EVALUATOR                              ║{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
-        
-        # Check if evaluation script exists
-        eval_script = self.src_dir / "evaluate_phase2.py"
+
+        eval_script = self.src_dir / "evaluate_phase3_llm.py"
         if not eval_script.exists():
-            print(f"{Colors.RED}Error: evaluate_phase2.py not found{Colors.RESET}")
+            print(f"{Colors.RED}Error: evaluate_phase3_llm.py not found{Colors.RESET}")
             return False
-        
-        print(f"{Colors.GREEN}Found evaluation script: {eval_script}{Colors.RESET}")
-        
-        # Confirm
+
+        models = detect_models_in_folder(str(self.project_dir / "models"))
+        phase3_models = [m for m in models if m.get('type') == 'phase3']
+
+        if not phase3_models:
+            print(f"{Colors.RED}No Phase 3 models found in models/. Run the training pipeline first.{Colors.RESET}")
+            return False
+
+        latest_model = phase3_models[0]
+        metadata = latest_model.get('metadata') or {}
+        market = metadata.get('market')
+
+        if not market:
+            market = self.detect_and_select_market()
+            if not market:
+                print(f"{Colors.YELLOW}Evaluation cancelled - no market selected.{Colors.RESET}")
+                return False
+
+        episodes = self.get_user_input(
+            f"{Colors.YELLOW}Evaluation episodes (default 20): {Colors.RESET}"
+        )
+        episodes = episodes if episodes and episodes.isdigit() else "20"
+
+        holdout_fraction_input = self.get_user_input(
+            f"{Colors.YELLOW}Holdout fraction (0-1, default 0.2): {Colors.RESET}"
+        )
+        try:
+            holdout_fraction = float(holdout_fraction_input) if holdout_fraction_input else 0.2
+        except ValueError:
+            holdout_fraction = 0.2
+
         confirm = self.get_user_input(
-            f"{Colors.YELLOW}Proceed with model evaluation? (y/n): {Colors.RESET}",
+            f"{Colors.YELLOW}Evaluate {latest_model['name']} on {market} holdout data? (y/n): {Colors.RESET}",
             ["y", "n", "Y", "N"]
         )
 
@@ -1104,35 +1229,41 @@ class RLTrainerMenu:
             print(f"{Colors.YELLOW}Evaluation cancelled.{Colors.RESET}")
             return False
 
-        # Market selection
-        selected_market = self.detect_and_select_market()
-        if selected_market is None:
-            print(f"{Colors.YELLOW}Evaluation cancelled - no market selected.{Colors.RESET}")
-            return False
+        print(f"{Colors.YELLOW}Note: Phase 3 evaluation requires Phi-3-mini-4k-instruct model in project folder{Colors.RESET}\n")
 
-        # Run evaluation
-        command = [sys.executable, str(eval_script), "--market", selected_market, "--non-interactive"]
-        success, output = self.run_command_with_progress(
+        command = [
+            sys.executable,
+            str(eval_script),
+            "--model", latest_model['path'],
+            "--market", market,
+            "--config", str(self.project_dir / "config" / "llm_config.yaml"),
+            "--episodes", episodes,
+            "--holdout-fraction", str(holdout_fraction),
+            "--baseline-model", "auto"
+        ]
+
+        success, _ = self.run_command_with_progress(
             command,
-            "Model Evaluation",
-            "evaluation.log"
+            "Phase 3 Hybrid Evaluation",
+            "evaluation_phase3.log"
         )
-        
-        if success:
-            print(f"\n{Colors.GREEN}✓ Evaluation completed successfully!{Colors.RESET}")
-            print(f"{Colors.CYAN}Results saved in results/{Colors.RESET}")
 
-            # Check for evaluation results
-            results_dir = self.project_dir / "results"
-            if results_dir.exists():
-                print(f"{Colors.YELLOW}Evaluation outputs:{Colors.RESET}")
-                for file in results_dir.glob("*"):
-                    if file.is_file():
-                        print(f"  - {file.name}")
+        if success:
+            self.print_evaluation_results()
         else:
-            print(f"\n{Colors.RED}✗ Evaluation failed. Check logs for details.{Colors.RESET}")
-        
+            print(f"\n{Colors.RED}✗ Evaluation failed. Check logs/evaluation_phase3.log{Colors.RESET}")
         return success
+
+    def print_evaluation_results(self):
+        """Display files created in results directory."""
+        print(f"\n{Colors.GREEN}✓ Evaluation completed successfully!{Colors.RESET}")
+        results_dir = self.project_dir / "results"
+        if results_dir.exists():
+            artifacts = [file.name for file in results_dir.glob("*") if file.is_file()]
+            if artifacts:
+                print(f"{Colors.CYAN}Results saved in results/{Colors.RESET}")
+                for name in artifacts:
+                    print(f"  - {name}")
     
     def show_instructions(self):
         """Show first-time user instructions."""

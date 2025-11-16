@@ -1,6 +1,13 @@
 # RL Trainer - AI Trading System Requirements
 # Python >= 3.11.9 required
 # Python 3.13 supported (with prebuilt wheels)
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# For Phase 3 LLM + LoRA fine-tuning:
+#   All required packages are included below (torch, transformers, peft, etc.)
+#   GPU with 8GB+ VRAM recommended for Phase 3 training
 
 # Core Dependencies (from TensorTrade)
 numpy>=1.26.4,<2.0
@@ -17,8 +24,9 @@ plotly>=4.5.0
 tensorflow>=2.15.1
 
 # Reinforcement Learning
-stable-baselines3>=2.0.0
-sb3-contrib>=2.0.0  # For MaskablePPO (Phase 1 & Phase 2 action masking)
+# PINNED VERSIONS for Phase 1/2 compatibility (transfer learning fix)
+stable-baselines3==2.3.2  # Pinned for model compatibility
+sb3-contrib==2.3.0  # For MaskablePPO (Phase 1 & Phase 2 action masking)
 
 # UI/Progress Visualization
 colorama>=0.4.6
@@ -41,10 +49,12 @@ ta>=0.4.7
 # LLM Integration (Phase 3 - required for hybrid RL+LLM agent)
 transformers>=4.35.0  # Hugging Face transformers
 torch>=2.1.0  # Required for LLM inference
-accelerate>=0.24.0  # Model acceleration
-bitsandbytes>=0.41.0  # INT8/INT4 quantization
-sentencepiece>=0.1.99  # Tokenizer support
-peft>=0.7.0  # LoRA fine-tuning (Phase 2 implementation)
+accelerate>=0.24.0  # Model acceleration and distributed training
+bitsandbytes>=0.41.0  # INT8/INT4 quantization (reduces VRAM usage)
+sentencepiece>=0.1.99  # Tokenizer support for Phi-3
+peft>=0.7.1  # LoRA/QLoRA fine-tuning (REQUIRED for Phase 3 adapter training)
+huggingface_hub>=0.22.0  # Offline snapshot downloads for LLM assets
+safetensors>=0.4.0  # Fast and safe tensor serialization (for model loading)
 
 # ============================================================================
 # Python Version Compatibility Notes:

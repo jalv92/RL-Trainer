@@ -47,6 +47,7 @@ from llm_reasoning import LLMReasoningModule
 from llm_features import LLMFeatureBuilder
 from model_utils import detect_available_markets
 from market_specs import get_market_spec
+from action_mask_utils import get_action_masks
 
 
 @dataclass
@@ -84,7 +85,6 @@ class TestConfig:
     llm_cache_size: int = 1000
     llm_batch_size: int = 8
     llm_quantization: str = "int8"
-    mock_llm: bool = False
     
     # Monitoring
     monitor_gpu: bool = True
@@ -805,17 +805,11 @@ class TestingFramework:
             }
         }
         self.decision_fusion = VectorizedDecisionFusion(fusion_config)
-        
-        # Initialize LLM (or mock for testing)
-        if self.config.mock_llm:
-            from llm_reasoning import MockLLMReasoningModule
-            llm_model = MockLLMReasoningModule()
-        else:
-            llm_model = LLMReasoningModule(
-                model_name="microsoft/Phi-3-mini-4k-instruct",
-                quantization=self.config.llm_quantization,
-                device=self.config.device
-            )
+
+        # Initialize LLM
+        llm_model = LLMReasoningModule(
+            config_path='config/llm_config.yaml'
+        )
         
         # Create hybrid agent
         hybrid_agent = HybridTradingAgent(
@@ -852,7 +846,7 @@ class TestingFramework:
                     action, _ = model.predict(obs, deterministic=True)
                 else:
                     # Hybrid agent
-                    action, _ = model.predict(obs, action_mask=eval_env.action_masks())
+                    action, _ = model.predict(obs, action_mask=get_action_masks(eval_env))
                 
                 obs, reward, terminated, truncated, info = eval_env.step(action)
                 episode_reward += reward
@@ -945,8 +939,7 @@ def create_test_config(mode: str, market: str, **kwargs) -> TestConfig:
         'learning_rate': 3e-4,
         'n_epochs': 5,
         'device': 'auto',
-        'enable_caching': True,
-        'mock_llm': False
+        'enable_caching': True
     }
     
     # Mode-specific configurations
@@ -981,7 +974,6 @@ if __name__ == "__main__":
     config = create_test_config(
         mode="hardware_maximized",
         market="NQ",
-        mock_llm=True,  # Use mock LLM for testing without GPU
         timesteps_reduction=0.05  # 5% for even faster testing
     )
     

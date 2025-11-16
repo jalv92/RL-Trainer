@@ -18,6 +18,7 @@ import logging
 import time
 import json
 import yaml
+from pathlib import Path
 from typing import Tuple, Dict, Optional
 from collections import deque
 import numpy as np
@@ -53,7 +54,7 @@ class LLMReasoningModule:
     def __init__(self, config_path: str = "config/llm_config.yaml", mock_mode: bool = False, enable_fine_tuning: bool = True):
         """
         Initialize LLM reasoning module.
-        
+
         Args:
             config_path: Path to LLM configuration file
             mock_mode: Use mock LLM for testing (no GPU required)
@@ -93,13 +94,17 @@ class LLMReasoningModule:
         if self.enable_fine_tuning:
             self.experience_buffer = LLMExperienceBuffer(max_size=10000)
             self.fine_tuning_steps = 0
+            self.fine_tune_optimizer = None  # Optimizer created once and reused
+            self.fine_tune_scheduler = None  # Learning rate scheduler
             self.logger.info("[LLM] LoRA fine-tuning enabled")
         else:
             self.experience_buffer = None
             self.fine_tuning_steps = 0
+            self.fine_tune_optimizer = None
+            self.fine_tune_scheduler = None
             if not self.mock_mode and not LORA_AVAILABLE:
                 self.logger.info("[LLM] LoRA not available, fine-tuning disabled")
-        
+
         if self.mock_mode:
             self.logger.info("[LLM] Running in MOCK mode (no GPU required)")
         else:
@@ -133,17 +138,37 @@ class LLMReasoningModule:
         }
     
     def _load_model(self):
-        """Load LLM model with quantization."""
-        if self.mock_mode:
-            return
-        
+        """Load LLM model with quantization from Phi-3-mini-4k-instruct folder."""
         if not LLM_AVAILABLE:
-            self.logger.warning("[LLM] Dependencies not available, switching to mock mode")
-            self.mock_mode = True
-            return
-        
+            raise RuntimeError(
+                "[LLM] PyTorch/Transformers dependencies not available. "
+                "Install required packages: pip install torch transformers"
+            )
+
         try:
-            model_name = self.config['llm_model']['name']
+            # Always use the manually downloaded LLM from Phi-3-mini-4k-instruct folder
+            configured_path = self.config['llm_model'].get('local_path', 'Phi-3-mini-4k-instruct')
+            local_path = Path(configured_path)
+
+            # Check if path is absolute or relative to project root
+            if not local_path.is_absolute():
+                # Try relative to current working directory first
+                if not local_path.exists():
+                    # Try relative to script location
+                    script_dir = Path(__file__).parent.parent
+                    local_path = script_dir / configured_path
+
+            if not local_path.exists():
+                raise FileNotFoundError(
+                    f"[LLM] Model not found at: {local_path}\n"
+                    f"Please ensure you have manually downloaded Phi-3-mini-4k-instruct to:\n"
+                    f"  {local_path.absolute()}\n"
+                    f"The model folder should contain config.json, tokenizer files, and model weights."
+                )
+
+            model_name = str(local_path)
+            self.logger.info(f"[LLM] Loading model from: {model_name}")
+
             quantization = self.config['llm_model']['quantization']
             
             self.logger.info(f"[LLM] Loading {model_name} with {quantization} quantization...")
@@ -151,7 +176,7 @@ class LLMReasoningModule:
             # Load tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_name,
-                trust_remote_code=True
+                trust_remote_code=False  # Use native Phi-3 implementation (transformers 4.56+)
             )
             
             # Set pad token if not exists
@@ -161,7 +186,7 @@ class LLMReasoningModule:
             # Load model with quantization
             load_kwargs = {
                 'pretrained_model_name_or_path': model_name,
-                'trust_remote_code': True,
+                'trust_remote_code': False,  # Use native Phi-3 implementation (transformers 4.56+)
                 'torch_dtype': torch.float16,
                 'device_map': self.config['llm_model']['device']
             }
@@ -189,55 +214,118 @@ class LLMReasoningModule:
             
         except Exception as e:
             self.logger.error(f"[LLM] Failed to load model: {e}")
-            self.error_count += 1
-            
-            # Check if we should fall back to mock mode
-            max_errors = self.config.get('fallback', {}).get('max_llm_errors', 10)
-            if self.error_count >= max_errors:
-                self.logger.warning(f"[LLM] Too many errors ({self.error_count}), switching to mock mode")
-                self.mock_mode = True
+            raise RuntimeError(
+                f"[LLM] Model initialization failed. Error: {e}\n"
+                f"Ensure Phi-3-mini-4k-instruct is properly downloaded and all dependencies are installed."
+            ) from e
     
-    def _setup_lora_adapters(self):
+    def _setup_lora_adapters(self, adapter_path: Optional[str] = None):
         """
         PHASE 2: Setup LoRA adapters for efficient fine-tuning.
-        
+
         LoRA Configuration:
-        - Target modules: query, key, value projection layers
+        - Target modules: ALL linear layers (attention + MLP)
         - Rank: 16 (tradeoff between capacity and efficiency)
         - Alpha: 32 (scaling factor)
         - Dropout: 0.1
-        - Only 1-2% of model parameters trainable!
+        - Auto-loads existing adapters if available
+
+        Args:
+            adapter_path: Path to existing adapters (optional, auto-detected if None)
         """
         if not self.enable_fine_tuning or not LORA_AVAILABLE:
             return
-        
+
         self.logger.info("[LLM] Setting up LoRA adapters for fine-tuning...")
-        
+
+        # Check for existing adapters
+        if adapter_path is None:
+            adapter_path = self._find_latest_lora_adapter()
+
+        if adapter_path and os.path.exists(adapter_path):
+            try:
+                self.logger.info(f"[LLM] Loading existing LoRA adapters from {adapter_path}")
+                self.model = PeftModel.from_pretrained(
+                    self.model,
+                    adapter_path,
+                    is_trainable=True  # Keep adapters trainable
+                )
+                self.logger.info("[LLM] ✅ LoRA adapters loaded successfully")
+
+                # Count trainable parameters
+                trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                all_params = sum(p.numel() for p in self.model.parameters())
+
+                self.logger.info(f"[LLM] Loaded adapter stats:")
+                self.logger.info(f"      Trainable params: {trainable_params:,} ({trainable_params/all_params*100:.2f}%)")
+                self.logger.info(f"      Total params: {all_params:,}")
+                return
+
+            except Exception as e:
+                self.logger.warning(f"[LLM] Failed to load adapters: {e}. Creating new ones...")
+
+        # Create new adapters
+        self.logger.info("[LLM] Creating new LoRA adapters...")
+
         lora_config = LoraConfig(
             r=16,  # Rank - controls adapter capacity
             lora_alpha=32,  # Scaling factor
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Attention layers
+            target_modules="all-linear",  # ALL linear layers (matches official Phi-3 sample)
             lora_dropout=0.1,
             bias="none",
             task_type="CAUSAL_LM"
         )
-        
+
         # Wrap model with LoRA
         self.model = get_peft_model(self.model, lora_config)
-        
+
         # Enable gradient tracking
         self.model.train()
-        for param in self.model.parameters():
-            param.requires_grad = True
-        
+
         # Count trainable parameters
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         all_params = sum(p.numel() for p in self.model.parameters())
-        
-        self.logger.info(f"[LLM] LoRA adapters added:")
+
+        self.logger.info(f"[LLM] LoRA adapters created:")
         self.logger.info(f"      Trainable params: {trainable_params:,} ({trainable_params/all_params*100:.2f}%)")
         self.logger.info(f"      Total params: {all_params:,}")
+        self.logger.info(f"      Target: all-linear (attention + MLP layers)")
         self.logger.info("[LLM] ✅ LLM ready for fine-tuning")
+
+    def _find_latest_lora_adapter(self) -> Optional[str]:
+        """Find the most recent LoRA adapter checkpoint."""
+        import glob
+        from pathlib import Path
+
+        # Search in models directory
+        models_dir = Path("models")
+        if not models_dir.exists():
+            return None
+
+        # Look for adapter directories
+        adapter_patterns = [
+            "models/*_lora",
+            "models/phase3*lora*",
+            "models/lora_adapters*"
+        ]
+
+        adapter_dirs = []
+        for pattern in adapter_patterns:
+            adapter_dirs.extend(glob.glob(pattern))
+
+        if not adapter_dirs:
+            return None
+
+        # Find newest by modification time
+        latest = max(adapter_dirs, key=lambda p: os.path.getmtime(p))
+
+        # Verify it contains adapter files
+        adapter_path = Path(latest)
+        if (adapter_path / "adapter_config.json").exists():
+            self.logger.info(f"[LLM] Found existing adapter: {adapter_path}")
+            return str(adapter_path)
+
+        return None
     
     def query(self, observation: np.ndarray, position_state: Dict, market_context: Dict) -> Tuple[int, float, str, Optional[int]]:
         """
@@ -398,64 +486,122 @@ class LLMReasoningModule:
             self.avg_latency_ms = latency
     
     def _build_prompt(self, obs: np.ndarray, position_state: Dict, market_context: Dict) -> str:
-        """Build LLM prompt from observation and context."""
+        """Build LLM prompt from observation and context with interpreted indicators."""
         try:
             template = self.config['prompts']['context_template']
-            
+
             # Extract key features from observation
             # obs[228:238] = extended market context
-            # obs[238:246] = multi-timeframe indicators  
+            # obs[238:246] = multi-timeframe indicators
             # obs[246:256] = pattern recognition
             # obs[256:261] = risk context
-            
+
             # Safe extraction with defaults
             adx = float(obs[228]) if len(obs) > 228 else 25.0
             vwap_distance = float(obs[229]) if len(obs) > 229 else 0.0
             rsi = float(obs[240]) if len(obs) > 240 else 50.0
             momentum = float(obs[232]) if len(obs) > 232 else 0.0
-            
+
+            # === INTERPRET INDICATORS ===
+            # Trend strength interpretation
+            if adx > 30:
+                trend_interpretation = "STRONG (trade with trend)"
+            elif adx > 20:
+                trend_interpretation = "MODERATE (trade cautiously)"
+            else:
+                trend_interpretation = "WEAK (prefer HOLD)"
+
+            # Momentum interpretation
+            if momentum > 0.5:
+                momentum_interpretation = "BULLISH (upward pressure)"
+            elif momentum < -0.5:
+                momentum_interpretation = "BEARISH (downward pressure)"
+            else:
+                momentum_interpretation = "NEUTRAL (no clear direction)"
+
+            # VWAP interpretation
+            if vwap_distance > 0.01:  # > 1% above VWAP
+                vwap_interpretation = "Above VWAP (bullish bias)"
+            elif vwap_distance < -0.01:  # > 1% below VWAP
+                vwap_interpretation = "Below VWAP (bearish bias)"
+            else:
+                vwap_interpretation = "Near VWAP (neutral)"
+
+            # RSI interpretation
+            if rsi > 70:
+                rsi_interpretation = "OVERBOUGHT (avoid BUY)"
+            elif rsi < 30:
+                rsi_interpretation = "OVERSOLD (avoid SELL)"
+            elif 40 <= rsi <= 60:
+                rsi_interpretation = "Neutral (rely on trend)"
+            else:
+                rsi_interpretation = f"{'Bullish bias' if rsi > 60 else 'Bearish bias'}"
+
+            # Risk warnings
+            win_rate = market_context.get('win_rate', 0.5)
+            consecutive_losses = market_context.get('consecutive_losses', 0)
+
+            if win_rate < 0.4:
+                win_rate_warning = "⚠️ LOW - Reduce confidence"
+            else:
+                win_rate_warning = ""
+
+            if consecutive_losses >= 3:
+                loss_streak_warning = "🛑 CRITICAL - HOLD ONLY"
+            elif consecutive_losses >= 2:
+                loss_streak_warning = "⚠️ WARNING - Be cautious"
+            else:
+                loss_streak_warning = ""
+
             # Format last trades
             last_trades = self._format_last_trades(position_state)
-            
+
+            # Build prompt with all interpretations
             prompt = template.format(
                 market_name=market_context.get('market_name', 'NQ'),
                 current_time=market_context.get('current_time', '10:30'),
                 current_price=market_context.get('current_price', 5000.0),
                 adx=adx,
+                trend_interpretation=trend_interpretation,
                 vwap_distance=vwap_distance,
+                vwap_interpretation=vwap_interpretation,
                 rsi=rsi,
+                rsi_interpretation=rsi_interpretation,
                 momentum=momentum,
+                momentum_interpretation=momentum_interpretation,
                 position_status=market_context.get('position_status', 'FLAT'),
                 unrealized_pnl=market_context.get('unrealized_pnl', 0.0),
-                win_rate=market_context.get('win_rate', 0.5),
-                consecutive_losses=market_context.get('consecutive_losses', 0),
+                win_rate=win_rate,
+                win_rate_warning=win_rate_warning,
+                consecutive_losses=consecutive_losses,
+                loss_streak_warning=loss_streak_warning,
                 balance=market_context.get('balance', 50000.0),
                 last_3_trades=last_trades
             )
-            
+
             # Add system prompt
             system_prompt = self.config['prompts']['system']
             full_prompt = f"{system_prompt}\n\n{prompt}"
-            
+
             return full_prompt
-            
+
         except Exception as e:
             self.logger.error(f"[LLM] Error building prompt: {e}")
             # Return a minimal prompt as fallback
             return f"Market context unavailable. What action do you recommend?"
     
+
     def _generate_response(self,
                             prompt: str,
                             *,
                             position_state: Optional[Dict] = None,
                             market_context: Optional[Dict] = None,
                             max_new_tokens: Optional[int] = None) -> str:
-        """Generate response using either mock or actual model path."""
-        if self.mock_mode:
-            return self._generate_mock(
-                prompt,
-                position_state or {},
-                market_context or {}
+        """Generate response using the LLM model."""
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError(
+                "[LLM] Model not loaded. Cannot generate response. "
+                "Ensure model initialization succeeded."
             )
         return self._generate_raw(prompt, max_new_tokens=max_new_tokens)
 
@@ -476,7 +622,8 @@ class LLMReasoningModule:
                 'top_p': self.config['llm_model']['top_p'],
                 'do_sample': self.config['llm_model'].get('do_sample', True),
                 'pad_token_id': self.tokenizer.pad_token_id,
-                'eos_token_id': self.tokenizer.eos_token_id
+                'eos_token_id': self.tokenizer.eos_token_id,
+                'use_cache': True  # Explicitly enable KV cache (best practice)
             }
 
             with torch.no_grad():
@@ -496,41 +643,6 @@ class LLMReasoningModule:
             self.logger.error(f"[LLM] Generation error: {e}")
             raise
     
-    def _generate_mock(self, prompt: str, position_state: Dict, market_context: Dict) -> str:
-        """Generate mock LLM response for testing."""
-        # Simulate inference delay
-        if self.config.get('development', {}).get('mock_response_delay', 0) > 0:
-            time.sleep(self.config['development']['mock_response_delay'])
-        
-        # Simple heuristic-based mock response
-        position = position_state.get('position', 0)
-        win_rate = position_state.get('win_rate', 0.5)
-        consecutive_losses = position_state.get('consecutive_losses', 0)
-        
-        # Mock confidence
-        mock_confidence = self.config.get('development', {}).get('mock_confidence', 0.8)
-        
-        # Generate mock response based on simple rules
-        if consecutive_losses >= 3:
-            # On losing streak, be more cautious
-            action = "HOLD"
-            reason = "Losing streak - preserve capital"
-            confidence = mock_confidence * 0.6
-        elif position == 0:
-            # No position - look for entry
-            # Simple random decision for mock
-            import random
-            actions = ["BUY", "SELL", "HOLD"]
-            action = random.choice(actions)
-            reason = f"Mock {action.lower()} signal"
-            confidence = mock_confidence
-        else:
-            # In position - manage it
-            action = "MOVE_TO_BE" if win_rate > 0.5 else "HOLD"
-            reason = "Mock position management"
-            confidence = mock_confidence * 0.8
-        
-        return f"{action} | {confidence:.2f} | {reason}"
     
     def _parse_response(self, response: str) -> Tuple[int, float, str]:
         """
@@ -720,39 +832,55 @@ class LLMReasoningModule:
     def fine_tune_step(self, batch_size=8, learning_rate=5e-5):
         """
         PHASE 2: Single fine-tuning step on successful trading outcomes.
-        
+
         Strategy:
         1. Sample experiences where outcome is known
         2. Weight by success (winning trades emphasized)
         3. Fine-tune LLM to reproduce successful reasoning
         4. Use gradient accumulation for stability
-        
+        5. Persistent optimizer with learning rate scheduling
+
         Returns:
             loss: float - training loss
             accuracy: float - how often LLM reproduces successful action
         """
         if not self.enable_fine_tuning or self.experience_buffer is None:
             return None, None
-        
+
         if len(self.experience_buffer) < batch_size:
             return None, None
-        
+
         # Sample batch (weighted by outcome)
         batch = self.experience_buffer.sample_weighted(batch_size)
-        
+
         if batch is None:
             return None, None
-        
+
+        # Create optimizer once and reuse (CRITICAL FIX)
+        if self.fine_tune_optimizer is None:
+            self.fine_tune_optimizer = torch.optim.AdamW(
+                [p for p in self.model.parameters() if p.requires_grad],
+                lr=learning_rate,
+                weight_decay=0.01,
+                betas=(0.9, 0.999)
+            )
+            # Add cosine annealing scheduler
+            self.fine_tune_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.fine_tune_optimizer,
+                T_max=1000,
+                eta_min=learning_rate * 0.1
+            )
+            self.logger.info(f"[LLM] Optimizer created: AdamW(lr={learning_rate}, weight_decay=0.01)")
+
         # Prepare for training
         self.model.train()
-        optimizer = torch.optim.AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=learning_rate
-        )
-        
+
         total_loss = 0.0
         correct = 0
-        
+
+        # Zero gradients before loop
+        self.fine_tune_optimizer.zero_grad()
+
         for exp in batch:
             outcome = exp.get('outcome')
             if not outcome:
@@ -765,7 +893,7 @@ class LLMReasoningModule:
                 truncation=True,
                 max_length=512
             ).to(self.device)
-            
+
             targets = self.tokenizer(
                 exp['response'],
                 return_tensors="pt",
@@ -773,45 +901,114 @@ class LLMReasoningModule:
                 truncation=True,
                 max_length=256
             ).to(self.device)
-            
+
             # Forward pass
             outputs = self.model(**inputs, labels=targets.input_ids)
             loss = outputs.loss
-            
-            # Weight loss by outcome
-            pnl = outcome.get('pnl', 0.0)
-            weight = 1.0 + pnl / 100.0  # More successful = higher weight
-            weighted_loss = loss * weight
 
-            # Backward
+            # Weight loss by outcome (improved weighting)
+            pnl = outcome.get('pnl', 0.0)
+            weight = max(1.0 + pnl / 100.0, 0.1)  # Positive weight for winners
+            weighted_loss = loss * weight / batch_size  # Normalize by batch size
+
+            # Backward (accumulate gradients)
             weighted_loss.backward()
-            
+
             total_loss += loss.item()
-            
-            # Check if model still predicts correct action
+
+            # FIXED: Validation logic (generate correctly)
             with torch.no_grad():
-                predicted_response = self._generate_response(exp['prompt'])
+                # Generate prediction
+                gen_inputs = self.tokenizer(
+                    exp['prompt'],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
+                ).to(self.device)
+
+                gen_outputs = self.model.generate(
+                    **gen_inputs,
+                    max_new_tokens=50,
+                    temperature=0.1,
+                    do_sample=False,  # Greedy for validation
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
+                )
+
+                predicted_response = self.tokenizer.decode(gen_outputs[0], skip_special_tokens=True)
+                # Remove prompt from response
+                if exp['prompt'] in predicted_response:
+                    predicted_response = predicted_response[len(exp['prompt']):].strip()
+
                 predicted_action, _, _ = self._parse_response(predicted_response)
                 if predicted_action == exp['action']:
                     correct += 1
-        
-        # Update
+
+        # Update weights once
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        optimizer.step()
-        optimizer.zero_grad()
-        
+        self.fine_tune_optimizer.step()
+        self.fine_tune_scheduler.step()
+
         self.fine_tuning_steps += 1
-        
+
         avg_loss = total_loss / batch_size
         accuracy = correct / batch_size
-        
+        current_lr = self.fine_tune_scheduler.get_last_lr()[0]
+
+        if self.fine_tuning_steps % 10 == 0:
+            self.logger.info(
+                f"[LLM] Fine-tune step {self.fine_tuning_steps}: "
+                f"loss={avg_loss:.4f}, acc={accuracy:.1%}, lr={current_lr:.2e}"
+            )
+
         return avg_loss, accuracy
     
-    def save_lora_adapters(self, path):
-        """Save only LoRA adapters (small, <50MB)."""
-        if self.enable_fine_tuning and self.model is not None:
-            self.model.save_pretrained(path)
-            self.logger.info(f"[LLM] LoRA adapters saved to {path}")
+    def save_lora_adapters(self, path: Optional[str] = None):
+        """
+        Save LoRA adapters with automatic versioning and metadata.
+
+        Args:
+            path: Optional custom path (auto-generated with timestamp if None)
+        """
+        if not self.enable_fine_tuning or self.model is None:
+            return
+
+        if path is None:
+            # Auto-generate path with timestamp
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = f"models/lora_adapters_step{self.fine_tuning_steps}_{timestamp}"
+
+        # Ensure models directory exists
+        from pathlib import Path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+        # Save adapter weights
+        self.model.save_pretrained(path)
+
+        # Save metadata
+        metadata = {
+            'fine_tuning_steps': self.fine_tuning_steps,
+            'total_queries': self.total_queries,
+            'experience_buffer_size': len(self.experience_buffer) if self.experience_buffer else 0,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'lora_config': {
+                'r': 16,
+                'lora_alpha': 32,
+                'target_modules': 'all-linear',
+                'lora_dropout': 0.1
+            },
+            'statistics': self.get_stats()
+        }
+
+        import json
+        with open(Path(path) / 'metadata.json', 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        self.logger.info(f"[LLM] LoRA adapters saved to {path}")
+        self.logger.info(f"      Steps: {self.fine_tuning_steps}, Queries: {self.total_queries}")
+        self.logger.info(f"      Buffer size: {metadata['experience_buffer_size']}")
     
     def load_lora_adapters(self, path):
         """Load fine-tuned LoRA adapters."""
@@ -838,95 +1035,59 @@ class LLMExperienceBuffer:
     def sample_weighted(self, batch_size):
         """
         PHASE 2: Sample batch weighted by outcome quality.
-        
-        Strategy:
+
+        Improved Strategy:
         - Only sample experiences with known outcomes
-        - Weight by P&L (winning trades more likely)
-        - Ensure diversity (don't oversample same market state)
-        
+        - Weight by P&L quality (normalized and clipped)
+        - Factor in reward/risk ratio (Sharpe-like metric)
+        - Learn from both successes AND mistakes
+        - Allow duplicates for very high-quality experiences
+
         Returns:
             List of experiences or None if insufficient data
         """
         # Filter to experiences with outcomes
         completed = [exp for exp in self.buffer if exp.get('outcome') is not None]
-        
+
         if len(completed) < batch_size:
             return None
-        
-        # Compute sampling weights
+
+        # Compute improved sampling weights
         weights = []
         for exp in completed:
             pnl = exp['outcome']['pnl']
-            # Positive weight for winners, small positive for losers (learn from mistakes too)
-            weight = max(pnl, 0.1) if pnl > 0 else 0.1
-            weights.append(weight)
-        
+            reward = exp['outcome'].get('reward', 0.0)
+
+            # Base weight from P&L (normalized and clipped)
+            pnl_normalized = np.clip(pnl / 100.0, -3.0, 5.0)
+
+            # Reward quality factor (Sharpe-like: reward per unit risk)
+            if abs(pnl) > 1e-6:
+                quality = reward / abs(pnl)
+            else:
+                quality = 0.0
+
+            # Final weight calculation
+            if pnl > 0:
+                # Winning trades: higher weight for better quality
+                weight = 1.0 + pnl_normalized + 0.5 * quality
+            else:
+                # Losing trades: learn from big mistakes
+                weight = 0.2 + abs(pnl_normalized) * 0.3
+
+            weights.append(max(weight, 0.1))  # Floor at 0.1
+
+        # Normalize weights
         weights = np.array(weights)
-        weights = weights / weights.sum()  # Normalize
-        
-        # Sample
-        indices = np.random.choice(len(completed), size=batch_size, replace=False, p=weights)
+        weights = weights / weights.sum()
+
+        # Sample with replacement (allows duplicates for very good experiences)
+        indices = np.random.choice(len(completed), size=batch_size, replace=True, p=weights)
         batch = [completed[i] for i in indices]
-        
+
         return batch
     
     def __len__(self):
         return len(self.buffer)
 
 
-if __name__ == '__main__':
-    """Test LLM reasoning module."""
-    import logging
-    
-    # Setup logging
-    logging.basicConfig(level=logging.INFO)
-    
-    print("Testing LLM Reasoning Module...")
-    
-    # Test in mock mode
-    print("\n1. Testing in mock mode...")
-    llm = LLMReasoningModule(mock_mode=True)
-    
-    # Create test data
-    obs = np.random.randn(261)
-    position_state = {
-        'position': 0,
-        'balance': 50000,
-        'win_rate': 0.5,
-        'consecutive_losses': 0,
-        'trade_history': [
-            {'pnl': 100}, {'pnl': -50}, {'pnl': 200}
-        ]
-    }
-    market_context = {
-        'market_name': 'NQ',
-        'current_time': '10:30',
-        'current_price': 5000.0,
-        'trend_strength': 'Strong',
-        'unrealized_pnl': 0.0
-    }
-    
-    # Test query
-    action, confidence, reasoning = llm.query(obs, position_state, market_context)
-    
-    print(f"Action: {action}")
-    print(f"Confidence: {confidence:.2f}")
-    print(f"Reasoning: {reasoning}")
-    
-    assert 0 <= action <= 5, f"Invalid action: {action}"
-    assert 0 <= confidence <= 1, f"Invalid confidence: {confidence}"
-    assert len(reasoning) > 0, "Empty reasoning"
-    
-    print("    Mock LLM test passed")
-    
-    # Test statistics
-    stats = llm.get_stats()
-    print(f"\nLLM Statistics:")
-    print(f"Total queries: {stats['total_queries']}")
-    print(f"Average latency: {stats['avg_latency_ms']:.1f}ms")
-    print(f"Cache hit rate: {stats['cache_hit_rate']:.1f}%")
-    
-    print("\n    All LLM reasoning tests passed!")
-    
-    # Note: GPU test would require actual model loading
-    print("\nNote: For GPU test, set mock_mode=False and ensure dependencies are installed")

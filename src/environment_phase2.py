@@ -57,7 +57,10 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         trailing_drawdown_limit: float = 2500,  # Strict Apex rules
         tighten_sl_step: float = 0.5,  # How much to tighten SL (in ATR)
         extend_tp_step: float = 1.0,   # How much to extend TP (in ATR)
-        trailing_activation_profit: float = 1.0  # Activate trail after 1R profit
+        trailing_activation_profit: float = 1.0,  # Activate trail after 1R profit
+        start_index: Optional[int] = None,
+        randomize_start_offsets: bool = True,
+        min_episode_bars: int = 1500,
     ):
         """
         Initialize Phase 2 environment with position management.
@@ -82,7 +85,10 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             data, initial_balance, window_size, second_data,
             market_spec, commission_override,  # Pass market specs
             initial_sl_multiplier, initial_tp_ratio, position_size_contracts,
-            trailing_drawdown_limit
+            trailing_drawdown_limit,
+            start_index=start_index,
+            randomize_start_offsets=randomize_start_offsets,
+            min_episode_bars=min_episode_bars
         )
 
         # Phase 2: Simplified action space (3 -> 6 actions)
@@ -478,6 +484,8 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             terminated = True
             reward = -0.1
             done_reason = 'minute_trailing_drawdown'
+            self.done_reason = done_reason  # DIAGNOSTIC: Track for analysis
+            self.max_drawdown_reached = self.highest_balance - portfolio_value  # DIAGNOSTIC
 
         # Check violation at second-level (Apex compliance)
         if not terminated and self.second_data is not None:
@@ -487,6 +495,8 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                 terminated = True
                 reward = -0.1  # Heavy penalty for Apex violation
                 done_reason = 'second_level_trailing_drawdown'
+                self.done_reason = done_reason  # DIAGNOSTIC
+                self.max_drawdown_reached = self.highest_balance - portfolio_value  # DIAGNOSTIC
 
         # ============================================================
         # 5. CALCULATE REWARD (Apex-Optimized)
@@ -506,8 +516,11 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             truncated = True
             if done_reason is None:
                 done_reason = 'end_of_data'
+                self.done_reason = done_reason  # DIAGNOSTIC
 
         obs = self._get_observation()
+
+        # DIAGNOSTIC: Enhanced info dict with compliance details
         info = {
             'portfolio_value': portfolio_value,
             'position': self.position,
@@ -523,10 +536,14 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             'remaining_bars': max(len(self.data) - self.current_step, 0),
             'bar_timestamp': str(self.data.index[min(self.current_step - 1, len(self.data) - 1)]),
             'done_reason': done_reason,
+            'max_drawdown': getattr(self, 'max_drawdown_reached', 0),  # DIAGNOSTIC
+            'episode_bars': self.current_step - self._episode_start_index,  # DIAGNOSTIC
+            'trailing_dd_level': self.trailing_dd_level,  # DIAGNOSTIC
         }
 
         if done_reason:
             self.last_done_reason = done_reason
+            self.done_reason = done_reason  # DIAGNOSTIC: Ensure instance variable set
 
         return obs, reward, terminated, truncated, info
 

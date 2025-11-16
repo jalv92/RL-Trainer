@@ -60,10 +60,14 @@ class TradingEnvironmentPhase1(gym.Env):
         enable_daily_loss_limit: bool = False,  # DISABLED for Phase 1
         enable_profit_target: bool = False,     # DISABLED for Phase 1
         enable_4pm_rule: bool = True,           # Keep this for safety
+        # Episode randomization parameters (FIXED BUG)
+        start_index: Optional[int] = None,
+        randomize_start_offsets: bool = True,
+        min_episode_bars: int = 1500,
     ):
         """
         Initialize Phase 1 trading environment - FIXED.
-        
+
         Args:
             data: OHLCV + indicators DataFrame (minute bars)
             initial_balance: Starting capital ($50,000 for Apex)
@@ -78,6 +82,9 @@ class TradingEnvironmentPhase1(gym.Env):
             enable_daily_loss_limit: Enable daily loss limit (FALSE for Phase 1)
             enable_profit_target: Enable profit target (FALSE for Phase 1)
             enable_4pm_rule: Enable 4:59 PM close rule (TRUE for safety)
+            start_index: Static episode start index (None = use randomization)
+            randomize_start_offsets: Enable random episode start points (TRUE for training)
+            min_episode_bars: Minimum bars remaining after episode start (1500 default)
         """
         super().__init__()
 
@@ -128,6 +135,12 @@ class TradingEnvironmentPhase1(gym.Env):
         # Gymnasium spaces
         self.action_space = spaces.Discrete(3)
         
+        # Episode randomness
+        self.randomize_start_offsets = randomize_start_offsets
+        self.static_start_index = start_index
+        self.min_episode_bars = max(min_episode_bars, window_size + 10)
+        self._episode_start_index: Optional[int] = None
+
         # SIMPLIFIED observation space - reduced features
         # Previous: (window_size * 11 + 5,) = (225,)
         # New: (window_size * 11 + 5,) = (225,) - Kept core features, removed some complex ones
@@ -146,7 +159,9 @@ class TradingEnvironmentPhase1(gym.Env):
         """Reset environment to initial state."""
         super().reset(seed=seed)
 
-        self.current_step = self.window_size
+        episode_start = self._determine_episode_start(seed)
+        self._episode_start_index = episode_start
+        self.current_step = max(self.window_size, min(episode_start, len(self.data) - 1))
         self.balance = self.initial_balance
         self.position = 0  # 0=flat, 1=long, -1=short
         self.entry_price = 0
@@ -185,7 +200,35 @@ class TradingEnvironmentPhase1(gym.Env):
         self.buy_count = 0
         self.sell_count = 0
 
-        return self._get_observation(), {}
+        # DIAGNOSTIC: Track termination reason for analysis
+        self.done_reason = None
+        self.max_drawdown_reached = self.initial_balance
+
+        info = {
+            'episode_start_index': self._episode_start_index,
+            'episode_start_timestamp': str(self.data.index[min(self.current_step, len(self.data) - 1)])
+        }
+
+        return self._get_observation(), info
+
+    def _determine_episode_start(self, seed: Optional[int] = None) -> int:
+        """Compute start index ensuring sufficient remaining bars."""
+        min_start = self.window_size
+        max_start = len(self.data) - max(self.min_episode_bars, 10)
+        if max_start <= min_start:
+            return min_start
+
+        if self.randomize_start_offsets:
+            rng = getattr(self, 'np_random', None)
+            if rng is not None:
+                return int(rng.integers(min_start, max_start + 1))
+            generator = np.random.default_rng(seed)
+            return int(generator.integers(min_start, max_start + 1))
+
+        if self.static_start_index is not None:
+            return max(min_start, min(self.static_start_index, max_start))
+
+        return min_start
 
     def _normalize_position_size(self, raw_size: float) -> float:
         """Ensure futures contract counts remain integer and >= 1."""
@@ -418,11 +461,13 @@ class TradingEnvironmentPhase1(gym.Env):
         if self._check_apex_time_rules(current_time):
             terminated = True
             self.violation_occurred = True
+            self.done_reason = "apex_time_violation"  # DIAGNOSTIC
             reward = -0.05  # Reduced penalty for Phase 1
             return self._get_observation(), reward, terminated, False, {
                 'portfolio_value': self.balance,
                 'position': self.position,
-                'apex_violation': True
+                'apex_violation': True,
+                'done_reason': self.done_reason  # DIAGNOSTIC
             }
         
         # 3. EXECUTE NEW ACTION (if flat)
@@ -500,6 +545,8 @@ class TradingEnvironmentPhase1(gym.Env):
         if self.current_step % 10 == 0 and portfolio_value < self.trailing_dd_level:
             terminated = True
             self.violation_occurred = True
+            self.done_reason = "trailing_drawdown_minute"  # DIAGNOSTIC
+            self.max_drawdown_reached = self.highest_balance - portfolio_value  # DIAGNOSTIC
             reward = -0.05  # Reduced penalty
 
         # Check violation at second-level (RELAXED - less frequent)
@@ -509,20 +556,24 @@ class TradingEnvironmentPhase1(gym.Env):
             if drawdown_hit:
                 terminated = True
                 self.violation_occurred = True
+                self.done_reason = "trailing_drawdown_second"  # DIAGNOSTIC
+                self.max_drawdown_reached = self.highest_balance - portfolio_value  # DIAGNOSTIC
                 reward = -0.05  # Reduced penalty
 
         # Daily loss limit (DISABLED for Phase 1)
         if self.enable_daily_loss_limit and trade_pnl != 0:
             self._update_daily_pnl(trade_pnl)
-            
+
             if self._check_daily_loss_limit():
                 terminated = True
                 self.violation_occurred = True
+                self.done_reason = "daily_loss_limit"  # DIAGNOSTIC
                 reward = -0.05  # Reduced penalty
                 return self._get_observation(), reward, terminated, False, {
                     'portfolio_value': self.balance,
                     'position': self.position,
-                    'daily_loss_violation': True
+                    'daily_loss_violation': True,
+                    'done_reason': self.done_reason  # DIAGNOSTIC
                 }
         
         # Track position hold time
@@ -544,8 +595,12 @@ class TradingEnvironmentPhase1(gym.Env):
 
         if self.current_step >= len(self.data) - 1:
             truncated = True
+            if self.done_reason is None:  # DIAGNOSTIC
+                self.done_reason = "end_of_data"
 
         obs = self._get_observation()
+
+        # DIAGNOSTIC: Enhanced info dict with compliance details
         info = {
             'portfolio_value': portfolio_value,
             'position': self.position,
@@ -554,7 +609,11 @@ class TradingEnvironmentPhase1(gym.Env):
             'winning_trades': self.winning_trades,
             'losing_trades': self.losing_trades,
             'win_rate': self.winning_trades / max(self.num_trades, 1),
-            'violation_occurred': self.violation_occurred
+            'violation_occurred': self.violation_occurred,
+            'done_reason': self.done_reason,  # DIAGNOSTIC
+            'max_drawdown': self.max_drawdown_reached,  # DIAGNOSTIC
+            'episode_bars': self.current_step - self._episode_start_index,  # DIAGNOSTIC
+            'trailing_dd_level': self.trailing_dd_level,  # DIAGNOSTIC
         }
 
         return obs, reward, terminated, truncated, info

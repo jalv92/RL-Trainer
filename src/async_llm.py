@@ -109,9 +109,7 @@ class AsyncLLMInference:
                 # Get result
                 try:
                     result = future.result(timeout=timeout_ms/1000.0)
-
-                    # Cache
-                    self.latest_results[env_id] = result
+                    result = dict(result) if result is not None else None
 
                     # Update stats
                     latency_ms = (time.time() - pending['submit_time']) * 1000
@@ -123,7 +121,13 @@ class AsyncLLMInference:
                     # Cleanup
                     del self.pending_queries[env_id]
 
-                    return result
+                    if result is not None:
+                        result['is_new'] = True
+                        cached_result = dict(result)
+                        cached_result['is_new'] = False
+                        self.latest_results[env_id] = cached_result
+                        return result
+                    return None
 
                 except Exception as e:
                     # Query failed
@@ -132,7 +136,10 @@ class AsyncLLMInference:
                     return None
 
         # Not ready yet, return cached result from previous step
-        return self.latest_results.get(env_id, None)
+        cached = self.latest_results.get(env_id)
+        if cached is not None:
+            return cached
+        return None
 
     def _execute_query(self, observation, position_state, market_context, available_actions):
         """
@@ -284,7 +291,8 @@ class BatchedAsyncLLM:
                     'reasoning': reasoning,
                     'query_id': query_id,
                     'latency_ms': (time.time() - query['submit_time']) * 1000,
-                    'success': True
+                    'success': True,
+                    'is_new': True
                 }
 
                 # Put in result queue
@@ -318,7 +326,8 @@ class BatchedAsyncLLM:
                     'reasoning': f"LLM_ERROR: {str(e)}",
                     'query_id': None,
                     'latency_ms': (time.time() - query['submit_time']) * 1000,
-                    'success': False
+                    'success': False,
+                    'is_new': True
                 }
 
                 if env_id in self.result_queues:
@@ -340,7 +349,8 @@ if __name__ == '__main__':
     import numpy as np
     import time
 
-    llm = LLMReasoningModule(config_path='config/llm_config.yaml', mock_mode=True)
+    print("Note: This test requires Phi-3-mini-4k-instruct model in project folder")
+    llm = LLMReasoningModule(config_path='config/llm_config.yaml')
     async_llm = AsyncLLMInference(llm, max_workers=4)
 
     # Submit queries

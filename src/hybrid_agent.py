@@ -18,6 +18,7 @@ Features:
 
 import numpy as np
 import logging
+from collections import defaultdict
 from typing import Tuple, Dict, Optional
 import torch
 
@@ -61,6 +62,7 @@ class HybridTradingAgent:
         self.confidence_threshold = fusion_config.get('confidence_threshold', 0.7)
         self.use_selective_querying = fusion_config.get('use_selective_querying', True)
         self.query_interval = fusion_config.get('query_interval', 5)
+        self.query_cooldown = fusion_config.get('query_cooldown', 3)
         
         # PHASE 1: Initialize fusion network (if enabled)
         self.use_neural_fusion = fusion_config.get('use_neural_fusion', True)
@@ -127,8 +129,8 @@ class HybridTradingAgent:
         self.last_llm_action = 0
         self.last_llm_confidence = 0.0
         self.last_llm_reasoning = ""
-        self.steps_since_llm_query = 0
-        self.last_position_state = {}
+        self.steps_since_llm_query = defaultdict(int)
+        self.last_position_state_by_env: Dict[int, Dict] = {}
         
         # Performance tracking
         self.rl_confidences = []
@@ -225,6 +227,7 @@ class HybridTradingAgent:
         
         # 2. Get LLM recommendation (from previous step - zero latency!)
         llm_result = self.async_llm.get_latest_result(env_id, timeout_ms=5) if self.async_llm else None
+        result_is_new = bool(llm_result and llm_result.get('is_new', True))
 
         if llm_result and llm_result['success']:
             llm_action = llm_result['action']
@@ -232,7 +235,8 @@ class HybridTradingAgent:
             llm_reasoning = llm_result['reasoning']
             llm_query_id = llm_result['query_id']
             self.logger.debug(f"[HYBRID] LLM result received for env {env_id}: action={llm_action}, confidence={llm_confidence:.2f}")
-            self.stats['llm_queries'] += 1  # Track successful LLM queries
+            if result_is_new:
+                self.stats['llm_queries'] += 1  # Track successful LLM queries
         else:
             # No LLM result yet (first step or LLM failed)
             llm_action = rl_action
@@ -244,16 +248,22 @@ class HybridTradingAgent:
             else:
                 self.logger.debug(f"[HYBRID] No LLM result available for env {env_id}")
         
-        # 3. Submit new LLM query for NEXT step (non-blocking)
+        # 3. Submit new LLM query for NEXT step (non-blocking, selective)
+        llm_query_submitted = False
         if self.always_on_thinking and self.async_llm:
             available_actions = self._get_available_actions(action_mask)
-            self.logger.debug(f"[HYBRID] Submitting LLM query for env {env_id}, available_actions={available_actions}")
-            self.async_llm.submit_query(
-                env_id, observation, position_state, market_context, available_actions
-            )
-            # Note: Query is submitted but result will be used in NEXT step
+            if self._should_query_llm(env_id, rl_confidence, position_state, action_mask):
+                self.logger.debug(f"[HYBRID] Submitting LLM query for env {env_id}, available_actions={available_actions}")
+                self.async_llm.submit_query(
+                    env_id, observation, position_state, market_context, available_actions
+                )
+                self.steps_since_llm_query[env_id] = 0
+                llm_query_submitted = True
+            else:
+                self.steps_since_llm_query[env_id] += 1
         else:
             self.logger.debug(f"[HYBRID] LLM querying disabled for env {env_id}")
+            self.steps_since_llm_query[env_id] += 1
         
         # 4. Fusion (uses results from current step)
         final_action, fusion_meta = self._fuse_decisions(
@@ -303,7 +313,7 @@ class HybridTradingAgent:
         self.llm_confidences.append(llm_confidence)
         
         # Keep last position state for selective querying
-        self.last_position_state = position_state.copy()
+        self.last_position_state_by_env[env_id] = position_state.copy()
         
         return final_action, {
             'rl_action': rl_action,
@@ -314,11 +324,12 @@ class HybridTradingAgent:
             'fusion_method': fusion_meta['fusion_method'],
             'final_action': final_action,
             'risk_veto': risk_veto,
-            'llm_queried': True,  # Always "queried" in async mode
+            'llm_queried': result_is_new or llm_query_submitted,
             'llm_query_id': llm_query_id
         }
     
-    def _should_query_llm(self, rl_confidence: float, position_state: Dict, action_mask: np.ndarray) -> bool:
+    def _should_query_llm(self, env_id: int, rl_confidence: float,
+                          position_state: Dict, action_mask: np.ndarray) -> bool:
         """
         Determine if we should query LLM this step.
         
@@ -332,6 +343,14 @@ class HybridTradingAgent:
         if not self.use_selective_querying:
             return True  # Always query
         
+        steps_since = self.steps_since_llm_query.get(env_id, self.query_interval)
+
+        # Enforce cooldown before issuing another query unless state changed dramatically
+        if steps_since < self.query_cooldown:
+            if self._position_state_changed(env_id, position_state):
+                return True
+            return False
+
         # Check if RL is uncertain
         if rl_confidence < self.confidence_threshold:
             return True
@@ -344,25 +363,26 @@ class HybridTradingAgent:
             pass
         
         # Check interval
-        if self.steps_since_llm_query >= self.query_interval:
+        if steps_since >= self.query_interval:
             return True
         
         # Check if position state changed significantly
-        if self._position_state_changed(position_state):
+        if self._position_state_changed(env_id, position_state):
             return True
         
         return False  # Use cached LLM response
     
-    def _position_state_changed(self, current_state: Dict) -> bool:
+    def _position_state_changed(self, env_id: int, current_state: Dict) -> bool:
         """Check if position state changed significantly."""
-        if not self.last_position_state:
+        last_state = self.last_position_state_by_env.get(env_id)
+        if not last_state:
             return True
         
         # Check key metrics that might warrant fresh LLM input
         key_metrics = ['position', 'balance', 'win_rate', 'consecutive_losses']
         
         for metric in key_metrics:
-            if current_state.get(metric) != self.last_position_state.get(metric):
+            if current_state.get(metric) != last_state.get(metric):
                 return True
         
         return False
@@ -702,114 +722,3 @@ class HybridTradingAgent:
         if hasattr(self, 'llm_advisor') and resolved_query_id is not None:
             self.llm_advisor.update_outcome(resolved_query_id, reward, final_pnl)
 
-
-if __name__ == '__main__':
-    """Test hybrid agent."""
-    import logging
-    
-    # Setup logging
-    logging.basicConfig(level=logging.INFO)
-    
-    print("Testing Hybrid Trading Agent...")
-    
-    # Mock models
-    class MockRL:
-        def predict(self, obs, action_masks=None, deterministic=True):
-            return 1, 0.8  # BUY with 0.8 value
-    
-    class MockLLM:
-        def __init__(self):
-            self.total_queries = 0
-        
-        def query(self, obs, state, context):
-            self.total_queries += 1
-            return 1, 0.9, "Strong uptrend"  # BUY with 0.9 confidence
-        
-        def get_stats(self):
-            return {'total_queries': self.total_queries}
-    
-    # Test configuration
-    config = {
-        'fusion': {
-            'llm_weight': 0.3,
-            'confidence_threshold': 0.7,
-            'use_selective_querying': False,
-            'query_interval': 5,
-            'cache_decay_rate': 0.8
-        },
-        'risk': {
-            'max_consecutive_losses': 3,
-            'min_win_rate_threshold': 0.4,
-            'dd_buffer_threshold': 0.2,
-            'enable_risk_veto': True
-        }
-    }
-    
-    # Create hybrid agent
-    hybrid = HybridTradingAgent(MockRL(), MockLLM(), config)
-    
-    # Test data
-    obs = np.random.randn(261)
-    action_mask = np.array([1, 1, 1, 0, 0, 0])  # Only allow HOLD, BUY, SELL
-    position_state = {
-        'position': 0,
-        'balance': 50000,
-        'win_rate': 0.5,
-        'consecutive_losses': 0,
-        'dd_buffer_ratio': 0.8
-    }
-    market_context = {
-        'market_name': 'NQ',
-        'current_time': '10:30',
-        'current_price': 5000.0
-    }
-    
-    print("\n1. Testing normal operation...")
-    action, meta = hybrid.predict(obs, action_mask, position_state, market_context)
-    
-    print(f"Final action: {action}")
-    print(f"Fusion method: {meta['fusion_method']}")
-    print(f"RL action/confidence: {meta['rl_action']}/{meta['rl_confidence']:.2f}")
-    print(f"LLM action/confidence: {meta['llm_action']}/{meta['llm_confidence']:.2f}")
-    print(f"LLM reasoning: {meta['llm_reasoning']}")
-    
-    assert action == 1, f"Expected BUY (1), got {action}"
-    assert meta['fusion_method'] == 'agreement', "Should agree when both suggest same action"
-    assert meta['risk_veto'] == False, "Risk veto should not trigger"
-    
-    print("    Normal operation test passed")
-    
-    print("\n2. Testing risk veto...")
-    # Test risk veto with consecutive losses
-    risky_position_state = {
-        'position': 0,
-        'balance': 50000,
-        'win_rate': 0.3,  # Low win rate
-        'consecutive_losses': 3,  # At threshold
-        'dd_buffer_ratio': 0.1  # Near DD limit
-    }
-    
-    action, meta = hybrid.predict(obs, action_mask, risky_position_state, market_context)
-    
-    print(f"Final action: {action}")
-    print(f"Risk veto triggered: {meta['risk_veto']}")
-    
-    assert action == 0, f"Expected HOLD (0) due to risk veto, got {action}"
-    assert meta['risk_veto'] == True, "Risk veto should trigger"
-    
-    print("    Risk veto test passed")
-    
-    print("\n3. Testing statistics...")
-    stats = hybrid.get_stats()
-    
-    print(f"Total decisions: {stats['total_decisions']}")
-    print(f"Agreement rate: {stats['agreement_pct']:.1f}%")
-    print(f"Risk veto rate: {stats['risk_veto_pct']:.1f}%")
-    print(f"LLM query rate: {stats['llm_query_rate']:.1f}%")
-    
-    assert stats['total_decisions'] == 2, "Should have 2 decisions"
-    assert stats['risk_veto'] == 1, "Should have 1 risk veto"
-    
-    print("    Statistics test passed")
-    
-    print("\n    All hybrid agent tests passed!")

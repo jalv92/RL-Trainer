@@ -4,6 +4,7 @@
 # LLM Model Selection
 llm_model:
   name: "microsoft/Phi-3-mini-4k-instruct"  # 3.8B parameters, ~4GB VRAM with INT8
+  local_path: "Phi-3-mini-4k-instruct"  # Fixed path to manually downloaded model
   quantization: "int8"  # Options: int8, int4, none
   device: "auto"  # Options: auto, cuda, cpu
   max_new_tokens: 50  # Max tokens for LLM response
@@ -13,10 +14,11 @@ llm_model:
 
 # Decision Fusion Parameters
 fusion:
-  llm_weight: 0.3  # How much to trust LLM (0.0 = RL only, 1.0 = LLM only)
-  confidence_threshold: 0.7  # Minimum confidence to override RL decision
+  llm_weight: 0.15  # How much to trust LLM (0.0 = RL only, 1.0 = LLM only) - REDUCED from 0.3
+  confidence_threshold: 0.75  # Minimum confidence to override RL decision - INCREASED from 0.7
   use_selective_querying: true  # Only query LLM when needed (reduces latency)
   query_interval: 5  # Query LLM every N bars when not uncertain
+  query_cooldown: 3  # Minimum bars between new async queries
   cache_llm_responses: true  # Cache LLM responses for reuse
   cache_decay_rate: 0.8  # Decay cached confidence by this factor
 
@@ -39,38 +41,76 @@ risk:
 # Prompt Templates
 prompts:
   system: |
-    You are a professional futures trader analyzing NQ (Nasdaq-100 E-mini).
-    Provide concise trading advice based on market context and risk management.
-    
+    You are an expert futures trader with proven profitability across all markets.
+    You strictly follow Apex Trader Funding rules and risk management principles.
+
+    === CORE TRADING RULES ===
+
+    1. TREND ANALYSIS (ADX-based):
+       - STRONG TREND (ADX > 30): Trade WITH trend only, high confidence
+       - MODERATE TREND (ADX 20-30): Trade with caution, normal confidence
+       - WEAK TREND (ADX < 20): Prefer HOLD, very low confidence entries
+
+    2. MOMENTUM CONFIRMATION:
+       - Momentum > 0 + Price > VWAP = BULLISH bias → Consider BUY
+       - Momentum < 0 + Price < VWAP = BEARISH bias → Consider SELL
+       - Conflicting signals = HOLD or reduce confidence
+
+    3. RSI OVERBOUGHT/OVERSOLD:
+       - RSI > 70: Overbought → Avoid BUY, consider SELL if trend confirms
+       - RSI < 30: Oversold → Avoid SELL, consider BUY if trend confirms
+       - RSI 40-60: Neutral zone, rely on trend/momentum
+
+    4. RISK MANAGEMENT (CRITICAL):
+       - Consecutive losses >= 3: MUST output HOLD | 0.0 | Risk protection
+       - Win rate < 40%: Reduce confidence by 50%, prefer HOLD
+       - Unrealized loss > -$500: Consider exit, do NOT add to losers
+
+    5. POSITION MANAGEMENT:
+       - Unrealized profit > +$150: Recommend MOVE_TO_BE (breakeven stop)
+       - Unrealized profit > +$300: Recommend ENABLE_TRAIL (lock profits)
+       - Choppy market (ADX < 20): Recommend DISABLE_TRAIL (avoid whipsaw)
+
+    === OUTPUT FORMAT (STRICT) ===
+    ACTION | confidence | brief_reason
+
+    Examples:
+    - "BUY | 0.85 | Strong uptrend ADX 42 above VWAP"
+    - "HOLD | 0.0 | Risk protection 3 losses"
+    - "MOVE_TO_BE | 0.90 | Profit +$200 protect capital"
+    - "SELL | 0.70 | Bearish momentum RSI 75"
+
     Available actions: HOLD, BUY, SELL, MOVE_TO_BE, ENABLE_TRAIL, DISABLE_TRAIL
-    Respond format: ACTION | confidence (0-1) | brief_reason (max 10 words)
-    
-    Guidelines:
-    - Consider trend strength, momentum, and support/resistance
-    - Factor in recent performance and risk metrics
-    - Be decisive but cautious with low confidence
-    - Prioritize capital preservation on losing streaks
-    
+
+    === KEY PRINCIPLES ===
+    - Capital preservation > profit seeking
+    - Never fight strong trends (ADX > 30)
+    - Respect losing streaks (3+ losses = HOLD)
+    - Use position management to lock profits
+
   context_template: |
-    Market: {market_name}
-    Time: {current_time} ET
-    Price: ${current_price:.2f}
-    
-    Trend Analysis:
-    - ADX: {adx:.1f} (trend strength)
-    - Price vs VWAP: {vwap_distance:+.2%}
-    - RSI: {rsi:.1f}
-    - Momentum: {momentum:.1f}
-    
-    Position: {position_status}
+    === MARKET: {market_name} ===
+    Time: {current_time} ET | Price: ${current_price:.2f}
+
+    === TREND & MOMENTUM ===
+    ADX: {adx:.1f} → Trend Strength: {trend_interpretation}
+    Momentum: {momentum:+.2f} → Direction: {momentum_interpretation}
+    VWAP Distance: {vwap_distance:+.2%} → Price Position: {vwap_interpretation}
+    RSI: {rsi:.1f} → Condition: {rsi_interpretation}
+
+    === POSITION STATUS ===
+    Current Position: {position_status}
     Unrealized P&L: ${unrealized_pnl:+.0f}
-    
-    Recent Performance:
-    - Win Rate: {win_rate:.1%}
-    - Consecutive Losses: {consecutive_losses}
-    - Account Balance: ${balance:.0f}
-    
-    What is your recommended action?
+
+    === RISK METRICS ===
+    Win Rate: {win_rate:.1%} {win_rate_warning}
+    Consecutive Losses: {consecutive_losses} {loss_streak_warning}
+    Account Balance: ${balance:.0f}
+    Last 3 Trades: {last_3_trades}
+
+    === DECISION REQUIRED ===
+    Based on the above analysis, what is your recommended action?
+    Remember: Follow the trading rules strictly. Prioritize risk management.
 
 # Performance Optimization
 performance:
@@ -97,7 +137,23 @@ fallback:
 
 # Development and Testing
 development:
-  mock_llm: false  # Use mock LLM for testing (no GPU required)
-  mock_response_delay: 0.1  # Artificial delay for mock LLM (seconds)
-  mock_confidence: 0.8  # Default confidence for mock responses
   verbose_logging: false  # Enable verbose logging for debugging
+
+# Checkpoint Configuration (Phase 3 specific)
+# Main checkpoint config is in config/checkpoint_config.yaml
+# These settings override defaults for Phase 3 LLM training
+checkpointing:
+  # Use base settings from checkpoint_config.yaml
+  use_default_config: true
+
+  # Phase 3 specific overrides
+  base_interval: 10000  # 10K steps (LLM can diverge quickly)
+
+  # Additional LLM-specific metadata fields
+  llm_metadata:
+    - reasoning_usage_rate      # % of decisions using LLM
+    - llm_confidence_avg        # Average LLM confidence
+    - rl_llm_agreement_rate     # % of RL-LLM agreement
+    - llm_error_count          # Cumulative LLM errors
+    - fusion_override_count    # Times LLM overrode RL
+    - risk_veto_count          # Times risk system vetoed decision

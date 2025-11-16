@@ -36,6 +36,7 @@ import glob
 import torch
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 # Add project root to path for imports
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,7 +54,7 @@ except (TypeError, ValueError):
 from sb3_contrib import MaskablePPO  # Using MaskablePPO for action masking
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, CallbackList
 
 # IMPORT PHASE 1 ENVIRONMENT
 from environment_phase1 import TradingEnvironmentPhase1
@@ -62,6 +63,14 @@ from feature_engineering import add_market_regime_features
 from model_utils import get_model_save_name, detect_available_markets, select_market_for_training
 from market_specs import get_market_spec
 from metadata_utils import write_metadata
+
+# CHECKPOINT MANAGEMENT
+from checkpoint_manager import DynamicCheckpointManager, MetricTrackingEvalCallback, EvalMetricHook
+from checkpoint_retention import CheckpointRetentionManager
+
+# SELF-CORRECTING SYSTEM
+from self_correcting_init import init_self_correcting_system
+from action_mask_utils import ensure_vecenv_action_masks
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':
@@ -137,8 +146,9 @@ except ImportError:
 # - Simplified reward function for entry quality
 # - Enhanced exploration parameters
 PHASE1_CONFIG = {
-    # Training - INCREASED for better data coverage and robust learning
-    'total_timesteps': 5_000_000,  # 5M for production (covers 80% of training data)
+    # Training - UPGRADED to 10M timesteps for better baseline
+    # IMPROVEMENT: Increased from 5M to 10M for stronger Phase 1 foundation
+    'total_timesteps': 10_000_000,  # 10M for production (PhaseGuard requirement)
     'num_envs': 80,  # Parallel environments
 
     # Network architecture - MAINTAINED for capacity
@@ -164,7 +174,7 @@ PHASE1_CONFIG = {
     'target_kl': 0.01,
     'use_kl_callback': True,
 
-    # Environment parameters - RELAXED for Phase 1
+    # Environment parameters - IMPROVED for longer episodes
     'window_size': 20,
     'initial_balance': 50000,
     'initial_sl_multiplier': 1.5,
@@ -172,18 +182,22 @@ PHASE1_CONFIG = {
     'position_size': 1.0,  # Futures exchanges require whole contracts
     'trailing_dd_limit': 15000,  # RELAXED from 5000 (was too restrictive)
     'episode_length': 390,  # 1 trading day
+    'min_episode_bars': 3000,  # IMPROVED: Increased from 1500 for longer episodes
+    'randomize_start_offsets': True,
+    'deterministic_env_offsets': False,
+    'start_offset_seed': 11,
 
     # Market specifications
     'commission_override': None,
 
-    # Evaluation - More frequent for better feedback
-    'eval_freq': 50_000,  # Every 50K steps
+    # Evaluation - IMPROVED: More frequent and better coverage
+    'eval_freq': 100_000,  # Every 100K steps (10M / 100K = 100 evaluations)
     'n_eval_episodes': 10,
 
-    # Early stopping - ENABLED but looser
+    # Early stopping - More patient for 10M timestep training
     'use_early_stopping': True,
-    'early_stop_max_no_improvement': 8,  # INCREASED from 5 (more patience)
-    'early_stop_min_evals': 5,  # INCREASED from 3
+    'early_stop_max_no_improvement': 10,  # INCREASED for longer training
+    'early_stop_min_evals': 5,
 
     # Device configuration
     'device': 'cuda'
@@ -332,54 +346,39 @@ def load_data(train_split=0.7, market=None):
 
 
 def make_env(data, second_data, env_id, config, market_spec):
-    """Create environment factory with random episode starts."""
+    """Create environment factory leveraging internal episode randomization."""
     def _init():
-        # Calculate episode parameters
-        episode_length = config.get('episode_length', 390)
-        window_size = config['window_size']
+        randomize = config.get('randomize_start_offsets', True)
+        deterministic_start = None
+        if not randomize:
+            deterministic_start = compute_env_start_index(len(data), config, env_id)
 
-        # TRUE random start position (no fixed seeding)
-        max_start = len(data) - episode_length - window_size
-        if max_start <= window_size:
-            start_idx = window_size
-        else:
-            start_idx = np.random.randint(0, max_start)
-
-        end_idx = start_idx + episode_length
-
-        # Extract episode data
-        env_data = data.iloc[start_idx:end_idx].copy()
-
-        # Filter second-level data for this episode
-        env_second_data = None
-        if second_data is not None:
-            start_time = data.index[start_idx]
-            end_time = data.index[end_idx-1]
-            mask = (second_data.index >= start_time) & (second_data.index < end_time)
-            env_second_data = second_data[mask].copy()
-
-        if env_id == 0:
-            safe_print(f"[ENV] Env {env_id}: Random start at index {start_idx}")
-            safe_print(f"[ENV] Episode length: {len(env_data)} bars")
-            safe_print(f"[ENV] Using Phase 1 environment with relaxed constraints")
-
-        # Use Phase 1 environment
         env = TradingEnvironmentPhase1(
-            data=env_data,
+            data=data,
             window_size=config['window_size'],
             initial_balance=config['initial_balance'],
-            second_data=env_second_data,
+            second_data=second_data,
             market_spec=market_spec,
             commission_override=config.get('commission_override', None),
             initial_sl_multiplier=config['initial_sl_multiplier'],
             initial_tp_ratio=config['initial_tp_ratio'],
             position_size_contracts=config['position_size'],
             trailing_drawdown_limit=config['trailing_dd_limit'],
-            # NEW: Disable constraints for Phase 1
+            start_index=deterministic_start,
+            randomize_start_offsets=randomize,
+            min_episode_bars=config.get('min_episode_bars', 1500),
             enable_daily_loss_limit=False,
             enable_profit_target=False,
             enable_4pm_rule=True,  # Keep this for safety
         )
+
+        # Validation: Ensure environment has randomization support
+        assert hasattr(env, 'randomize_start_offsets'), \
+            "Environment missing randomization support"
+        assert hasattr(env, 'min_episode_bars'), \
+            "Environment missing min_episode_bars attribute"
+        assert hasattr(env, '_determine_episode_start'), \
+            "Environment missing _determine_episode_start method"
 
         return Monitor(env)
 
@@ -487,6 +486,7 @@ def train_phase1(
         clip_obs=10.0,
         clip_reward=10.0
     )
+    env = ensure_vecenv_action_masks(env)
 
     safe_print("[ENV] Training environments created with VecNormalize")
 
@@ -503,11 +503,15 @@ def train_phase1(
         initial_tp_ratio=PHASE1_CONFIG['initial_tp_ratio'],
         position_size_contracts=PHASE1_CONFIG['position_size'],
         trailing_drawdown_limit=PHASE1_CONFIG['trailing_dd_limit'],
+        start_index=PHASE1_CONFIG['window_size'],
+        randomize_start_offsets=False,
+        min_episode_bars=PHASE1_CONFIG.get('min_episode_bars', 1500),
         enable_daily_loss_limit=False,
         enable_profit_target=False,
         enable_4pm_rule=True,
     ))])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    eval_env = ensure_vecenv_action_masks(eval_env)
 
     # Create learning rate schedule
     learning_rate = PHASE1_CONFIG['learning_rate']
@@ -584,29 +588,70 @@ def train_phase1(
         early_stop_callback = None
         safe_print("[TRAIN] Early stopping disabled")
 
+    # IMPROVEMENT: Add timestamp to evaluation logs to prevent overwriting
+    eval_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    eval_log_path = f'./logs/phase1/eval_{eval_timestamp}'
+    os.makedirs(eval_log_path, exist_ok=True)
+
+    safe_print(f"[EVAL] Evaluation logs will be saved to: {eval_log_path}")
+
+    # Initialize self-correcting system from configuration
+    registry, forecaster, metric_tracker, policy_controller, corrective_manager = init_self_correcting_system(
+        market=market_name,
+        phase=1,
+        config_path='config/checkpoint_config.yaml',
+        verbose=True
+    )
+
+    # Set seed for metric tracker
+    metric_tracker.set_seed(42)  # Match training seed
+
+    # Create metric hook to update tracker after each evaluation
+    metric_hook = EvalMetricHook(metric_tracker)
+
+    # Combine early stopping and metric tracking using CallbackList
+    # If early_stop_callback is None, only use metric_hook
+    if early_stop_callback is not None:
+        after_eval_callback = CallbackList([early_stop_callback, metric_hook])
+    else:
+        after_eval_callback = metric_hook
+
     eval_callback = EvalCallback(
         eval_env,
         eval_freq=PHASE1_CONFIG['eval_freq'],
         n_eval_episodes=PHASE1_CONFIG['n_eval_episodes'],
         best_model_save_path='./models/phase1/',
-        log_path='./logs/phase1/',
+        log_path=eval_log_path,  # IMPROVEMENT: Versioned log path
         deterministic=True,
         render=False,
         verbose=1,
-        callback_after_eval=early_stop_callback
+        callback_after_eval=after_eval_callback
     )
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=100_000,
-        save_path='./models/phase1/checkpoints/',
-        name_prefix='phase1',
-        save_replay_buffer=False,
-        save_vecnormalize=True
+    # IMPROVED: Dynamic checkpoint manager with adaptive intervals and event-driven saves
+    checkpoint_manager = DynamicCheckpointManager(
+        market=market_name,
+        phase=1,
+        seed=42,
+        config_path='config/checkpoint_config.yaml',
+        metric_tracker=metric_tracker,
+        target_timesteps=PHASE1_CONFIG['total_timesteps'],
+        verbose=True,
+        registry=registry  # Connect to global registry
     )
+    safe_print(f"[CHECKPOINT] Dynamic checkpoint manager initialized")
+    safe_print(f"[CHECKPOINT] Base interval: 25K steps (adaptive)")
+    safe_print(f"[CHECKPOINT] Event triggers: periodic, best, phase_end, interrupt")
 
-    # Build callbacks list
-    callbacks = [eval_callback, checkpoint_callback]
-    
+    # Build callbacks list (order matters: eval -> checkpoint -> controller -> corrective)
+    callbacks = [eval_callback, checkpoint_manager]
+
+    # Add optional self-correcting callbacks (if enabled in config)
+    if policy_controller is not None:
+        callbacks.append(policy_controller)
+    if corrective_manager is not None:
+        callbacks.append(corrective_manager)
+
     if PHASE1_CONFIG.get('use_kl_callback', False):
         kl_callback = KLDivergenceCallback(
             target_kl=PHASE1_CONFIG['target_kl'],
@@ -643,14 +688,32 @@ def train_phase1(
             progress_bar=use_progress_bar,
             reset_num_timesteps=not continue_training
         )
+        # Save phase_end checkpoint after successful training
+        checkpoint_manager.on_phase_end()
     except KeyboardInterrupt:
         safe_print("\n[TRAIN] Training interrupted by user")
-        safe_print("[TRAIN] Saving current model state...")
+        safe_print("[TRAIN] Saving interrupt checkpoint...")
+        checkpoint_manager.on_interrupt()
     except Exception as e:
         safe_print(f"\n[ERROR] Training failed: {e}")
+        # Save interrupt checkpoint on exception
+        try:
+            checkpoint_manager.on_interrupt()
+        except Exception:
+            pass
         raise
 
     elapsed = time.time() - start_time
+
+    # Run checkpoint retention cleanup
+    safe_print("\n[CHECKPOINT] Running checkpoint retention cleanup...")
+    try:
+        retention_manager = CheckpointRetentionManager('config/checkpoint_config.yaml')
+        checkpoint_dir = f'./models/phase1/{market_name}/checkpoints/'
+        retention_manager.prune_checkpoints(checkpoint_dir, dry_run=False, verbose=False)
+        safe_print("[CHECKPOINT] Retention cleanup completed")
+    except Exception as e:
+        safe_print(f"[WARNING] Checkpoint retention cleanup failed: {e}")
 
     # Save final model
     safe_print("\n[SAVE] Saving final Phase 1 model...")
@@ -703,6 +766,13 @@ def train_phase1(
 
     write_metadata(model_save_path, {**metadata_common, 'artifact': 'model'})
     write_metadata(vecnorm_save_path, {**metadata_common, 'artifact': 'vecnormalize'})
+
+    # CRITICAL FIX: Create legacy symlink for backward compatibility
+    # This allows PhaseGuard and other tools to find evaluation results at the legacy path
+    from pipeline.phase_guard import PhaseGuard
+    legacy_path = PhaseGuard.create_legacy_symlink('logs/phase1', use_copy=False)
+    if legacy_path:
+        safe_print(f"[COMPAT] Created legacy evaluation link: {legacy_path}")
 
     safe_print("\n" + "=" * 80)
     safe_print("PHASE 1 TRAINING COMPLETE!")
@@ -775,3 +845,20 @@ if __name__ == '__main__':
         non_interactive=args.non_interactive,
         test_mode=args.test,
     )
+def compute_env_start_index(data_length: int, config: dict, env_id: int) -> int:
+    """Deterministic start offset when randomization is disabled."""
+    min_start = config.get('window_size', 20)
+    min_episode_bars = max(config.get('min_episode_bars', 1500), 10)
+    max_start = data_length - min_episode_bars
+    if max_start <= min_start:
+        return min_start
+
+    if config.get('deterministic_env_offsets', False):
+        n_envs = max(1, config.get('num_envs', 1))
+        spacing = max(1, (max_start - min_start) // n_envs or 1)
+        start = min_start + spacing * env_id
+        return min(max(start, min_start), max_start)
+
+    seed = config.get('start_offset_seed')
+    rng = np.random.default_rng(seed + env_id if seed is not None else None)
+    return int(rng.integers(min_start, max_start + 1))

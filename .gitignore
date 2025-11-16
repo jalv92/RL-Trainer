@@ -93,6 +93,11 @@ results/*
 *.pdf
 *.svg
 
+# LLM artifacts/cache
+artifacts/
+!artifacts/.gitkeep
+@Phi-3-mini-4k-instruct/
+
 # Exception: Allow documentation images
 !img/*.png
 !img/*.jpg

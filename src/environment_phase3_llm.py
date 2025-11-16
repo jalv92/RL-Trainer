@@ -56,7 +56,11 @@ class TradingEnvironmentPhase3LLM(TradingEnvironmentPhase2):
         extend_tp_step: float = 1.0,
         trailing_activation_profit: float = 1.0,
         # PHASE 1 & 2: Hybrid agent for outcome tracking
-        hybrid_agent=None
+        hybrid_agent=None,
+        # Episode start management
+        start_index: Optional[int] = None,
+        randomize_start_offsets: bool = True,
+        min_episode_bars: int = 1500
     ):
         """
         Initialize Phase 3 environment with LLM features.
@@ -91,7 +95,10 @@ class TradingEnvironmentPhase3LLM(TradingEnvironmentPhase2):
             market_spec, commission_override,
             initial_sl_multiplier, initial_tp_ratio, position_size_contracts,
             trailing_drawdown_limit, tighten_sl_step, extend_tp_step,
-            trailing_activation_profit
+            trailing_activation_profit,
+            start_index=start_index,
+            randomize_start_offsets=randomize_start_offsets,
+            min_episode_bars=min_episode_bars
         )
         
         # Track additional state for LLM features
@@ -203,10 +210,9 @@ class TradingEnvironmentPhase3LLM(TradingEnvironmentPhase2):
         self.consecutive_losses = 0
         self.last_trade_result = 0.0
         self.peak_balance = self.initial_balance
-        self.entry_step = 0  # Track when position was entered
-        
+
         return obs, info
-    
+
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         Execute action with LLM state tracking.

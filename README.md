@@ -1,7 +1,5 @@
 # AI - TRAINER - AI Trading System
 
-![RL TRAINER Main Menu](img/Screenshot_105.png)
-
 A comprehensive reinforcement learning trading system with an interactive command-line interface for managing the complete ML pipeline from data processing to model evaluation.
 
 ## Overview
@@ -28,8 +26,6 @@ This project implements a **three-phase curriculum learning approach** for train
 
 ## Supported Instruments
 
-![Data Processing Menu](img/Screenshot_106.png)
-
 - **NQ** - Nasdaq 100 E-mini
 - **ES** - S&P 500 E-mini
 - **YM** - Dow Jones E-mini
@@ -43,109 +39,34 @@ This project implements a **three-phase curriculum learning approach** for train
 
 ```
 AI Trainer/
-├── main.py                      # Interactive menu system (main entry point)
-├── README.md                    # This file
-├── requirements.txt             # Python dependencies
-├── setup.py                     # TensorTrade package setup
+├── AGENTS.md                  # Repo guardrails & coding standards
+├── README.md                  # Usage guide (this file)
+├── changelog.md               # High-level change log
+├── requirements.txt           # Python dependencies
+├── pyrightconfig.json         # Type-checker settings
+├── main.py                    # Interactive CLI entry point
 │
-├── config/                      # Configuration files
-│   ├── llm_config.yaml          # Phase 3 LLM configuration
-│   ├── test_hardware_maximized.yaml  # Hardware testing config
-│   └── test_pipeline.yaml       # Pipeline testing config
+├── config/                    # Runtime configuration
+│   ├── llm_config.yaml              # Phase 3 LLM configuration
+│   ├── test_hardware_maximized.yaml # Testing framework preset
+│   └── test_pipeline.yaml           # Pipeline smoke-test preset
 │
-├── src/                         # Core source code (30 files)
-│   ├── Training & Environments
-│   │   ├── train_phase1.py         # Phase 1 training (2M timesteps)
-│   │   ├── train_phase2.py         # Phase 2 training (5M timesteps)
-│   │   ├── train_phase3_llm.py     # Phase 3 hybrid training
-│   │   ├── environment_phase1.py   # Base trading environment
-│   │   ├── environment_phase2.py   # Position management environment
-│   │   ├── environment_phase3_llm.py  # LLM-enhanced environment
-│   │   └── environment_phase1_simplified.py  # Simplified reward function
-│   │
-│   ├── Evaluation
-│   │   ├── evaluate_phase2.py      # Phase 2 evaluation
-│   │   └── evaluate_phase3_llm.py  # Phase 3 evaluation
-│   │
-│   ├── Data Processing
-│   │   ├── update_training_data.py      # Main data pipeline (auto corruption fix)
-│   │   ├── process_new_data.py          # Fast processing with corruption detection
-│   │   ├── reprocess_from_source.py     # Reprocess corrupted data
-│   │   ├── clean_second_data.py         # Second-level data cleaning
-│   │   ├── process_second_data.py       # Second-level data processing
-│   │   ├── data_validator.py            # Centralized validation functions
-│   │   └── validate_data_quality.py     # Data quality validation
-│   │
-│   ├── Feature Engineering
-│   │   ├── feature_engineering.py       # Market regime features
-│   │   ├── technical_indicators.py      # 11+ technical indicators
-│   │   └── llm_features.py              # Extended LLM features
-│   │
-│   ├── Trading Logic & Compliance
-│   │   ├── market_specs.py              # Market specifications (8 futures)
-│   │   ├── apex_compliance_checker.py   # Post-training compliance validation
-│   │   └── metadata_utils.py            # Model metadata management
-│   │
-│   ├── RL & LLM Integration
-│   │   ├── hybrid_agent.py              # Decision fusion module
-│   │   ├── llm_reasoning.py             # LLM reasoning module
-│   │   ├── llm_callback.py              # LLM training callbacks
-│   │   ├── kl_callback.py               # KL divergence monitoring
-│   │   └── model_utils.py               # Model detection and loading utilities
-│   │
-│   └── Utilities
-│       ├── testing_framework.py         # Optimized testing framework
-│       └── diagnose_environment.py      # Environment diagnostics
+├── src/                       # Core implementation
+│   ├── Data processing: update_training_data.py, process_new_data.py, reprocess_from_source.py, clean_second_data.py, process_second_data.py, data_validator.py, validate_data_quality.py
+│   ├── Training: train_phase1.py, train_phase2.py, train_phase3_llm.py
+│   ├── Environments: environment_phase1.py, environment_phase1_simplified.py, environment_phase2.py, environment_phase3_llm.py
+│   ├── Evaluation: evaluate_phase2.py, evaluate_phase3_llm.py
+│   ├── Hybrid/LLM stack: hybrid_agent.py, hybrid_policy*.py, fusion_network.py, async_llm.py, llm_reasoning.py, llm_features.py, llm_callback.py, chain_of_thought.py
+│   ├── Utilities: market_specs.py, metadata_utils.py, apex_compliance_checker.py, model_utils.py, feature_engineering.py, technical_indicators.py, testing_framework.py, diagnose_environment.py, kl_callback.py
 │
-├── data/                        # Training data (CSV files)
-│   ├── NQ_D1M.csv              # Example: NQ minute data
-│   ├── NQ_D1S.csv              # Example: NQ second data
-│   └── .gitkeep
-│
-├── models/                      # Saved model checkpoints
-│   ├── phase1_foundational_final.zip
-│   ├── phase2_position_mgmt_final.zip
-│   ├── phase3_hybrid_final.zip
-│   └── .gitkeep
-│
-├── results/                     # Evaluation results
-│   └── .gitkeep
-│
-├── logs/                        # Training and execution logs
-│   └── .gitkeep
-│
-├── tensorboard_logs/            # TensorBoard monitoring
-│   └── .gitkeep
-│
-├── img/                         # Screenshots and images
-│   ├── Screenshot_105.png       # Main menu
-│   ├── Screenshot_106.png       # Data processing
-│   └── Screenshot_107.png       # Evaluator
-│
-├── tests/                       # Test suite (8 files)
-│   ├── test_setup.py            # Installation verification
-│   ├── test_environment.py      # Environment tests
-│   ├── test_integration.py      # Integration tests
-│   ├── test_market_selection.py # Market selection tests
-│   ├── test_action_masking.py   # Action masking tests
-│   ├── test_llm_minimal.py      # Minimal LLM tests
-│   ├── test_llm_integration.py  # Full LLM integration tests
-│   └── __init__.py
-│
-├── docs/                        # Comprehensive documentation
-│   ├── Apex-Rules.md            # Apex Trader Funding compliance rules
-│   ├── QUICK_START_DATA_PROCESSING.md  # Quick start data guide
-│   ├── HYBRID_ARCHITECTURE.md   # Phase 3 architecture
-│   ├── LLM_INTEGRATION_GUIDE.md # LLM setup and customization
-│   ├── TESTING_FRAMEWORK_README.md     # Testing framework guide
-│   ├── FIXES_SUMMARY.md         # Recent fixes and improvements
-│   └── ...
-│
-└── scripts/                     # Utility scripts
-    ├── run_pipeline.py          # Automated pipeline execution
-    ├── benchmark_optimizations.py  # Performance benchmarking
-    └── validate_testing_framework.py  # Test validation
+├── data/                      # Market CSVs required for training (example NQ files kept)
+├── models/                    # Checkpoints (empty placeholders for upload)
+├── logs/                      # Runtime logs (emptied before packaging)
+├── results/                   # Evaluation artifacts (emptied)
+└── tensorboard_logs/          # TensorBoard runs (emptied)
 ```
+
+> Note: Documentation, screenshots, examples, scripted pipelines, and the legacy pytest suite were intentionally removed to keep the deployment bundle lightweight for pod uploads. The CLI, source tree, configs, and data hooks cover every required training/evaluation workflow.
 
 ## Installation
 
@@ -174,8 +95,8 @@ pip install -r requirements.txt
 # Test imports
 python -c "import gymnasium, stable_baselines3, pandas, numpy; print('✓ All core dependencies installed')"
 
-# Or run the verification script
-python tests/test_setup.py
+# Or run the pipeline smoke-test
+python src/testing_framework.py --mode pipeline --market NQ
 ```
 
 ## Quick Start
@@ -197,8 +118,6 @@ The interactive menu provides 5 main options:
 4. **Evaluator** - Evaluate trained models
 5. **Exit** - Close the program
 
-![Evaluator Menu](img/Screenshot_107.png)
-
 ### Continue Training Feature ⭐ NEW
 
 Resume training from any previously saved model:
@@ -209,7 +128,7 @@ python main.py
 # Select 3: Continue from Existing Model
 # Choose from list of available models
 # Select test or production mode
-```
+# (project structure block to be updated later)
 
 **Benefits:**
 - Resume interrupted training sessions
@@ -258,9 +177,8 @@ python src/update_training_data.py --market ES
 python src/reprocess_from_source.py --market NQ
 ```
 
-**Available markets:** NQ, ES, YM, RTY, MNQ, MES, M2K, MYM
-
-📖 **See:** `docs/QUICK_START_DATA_PROCESSING.md` for detailed guide
+**Available markets:** NQ, ES, YM, RTY, MNQ, MES, M2K, MYM  
+Tip: add `--dry-run` to preview every step without touching files.
 
 #### 2. Train Models
 
@@ -286,12 +204,35 @@ python src/train_phase3_llm.py --test
 #### 3. Evaluate Model
 
 ```bash
-# Phase 2 evaluation
-python src/evaluate_phase2.py
-
-# Phase 3 evaluation
-python src/evaluate_phase3_llm.py --model models/phase3_hybrid_final --market NQ
+python main.py
+# Select 4: Evaluator  (auto-loads latest Phase 3 model and tests on holdout data)
 ```
+
+Manual invocation (if you need custom settings):
+
+```bash
+python src/evaluate_phase3_llm.py \
+  --model models/phase3_hybrid/phase3_hybrid_final.zip \
+  --market NQ \
+  --episodes 20 \
+  --holdout-fraction 0.2
+```
+
+The evaluator automatically carves out the most recent 20 % of minute data as a holdout set, so performance metrics reflect unseen market conditions.
+Both the human-readable report and a JSON summary are written to `results/phase3_evaluation_<timestamp>.txt/.json` for easy archiving.
+
+### LLM Asset Preparation (Phase 3)
+
+Phase 3 uses the Phi-3-mini LLM. To keep the repo lean, the weights are downloaded on demand. You can manage them via the built-in helper:
+
+```bash
+# Download and cache the configured LLM locally
+python src/llm_asset_manager.py --download
+```
+
+If the cache is missing, the CLI will prompt you to either download (~4 GB) or run in mock mode (RL-only fallback). The download path is stored in `config/llm_config.yaml` under `llm_model.local_path`, so pods with fast internet can fetch once and reuse the weights offline.
+
+> **Requires:** `git` + `git lfs` (preferred). If git isn’t available the tool falls back to `huggingface_hub`, so `pip install huggingface_hub` is recommended as well.
 
 #### 4. View Training Progress
 
@@ -436,7 +377,7 @@ The system enforces 100% compliance with Apex rules:
 - Position size constraints
 - Trade frequency limits
 
-See `docs/Apex-Rules.md` for complete compliance details.
+These checks mirror the Apex Trader Funding guardrails enforced in every environment.
 
 ## Configuration
 
@@ -536,7 +477,6 @@ python main.py
 - `src/llm_reasoning.py` - LLM reasoning module
 - `src/llm_features.py` - Extended feature calculation
 - `config/llm_config.yaml` - LLM configuration
-- `docs/HYBRID_ARCHITECTURE.md` - Complete architecture documentation
 
 **Quick Start:**
 ```bash
@@ -570,10 +510,6 @@ python src/evaluate_phase3_llm.py \
     --episodes 20
 ```
 
-**Documentation:**
-- [Hybrid Architecture Guide](docs/HYBRID_ARCHITECTURE.md) - Complete system overview
-- [LLM Integration Guide](docs/LLM_INTEGRATION_GUIDE.md) - Setup and customization
-
 ## Testing Framework
 
 The system includes an **optimized testing framework** with two modes:
@@ -597,26 +533,12 @@ python src/testing_framework.py --mode hardware_maximized --market NQ
 python src/testing_framework.py --mode pipeline --market NQ
 ```
 
-### Run Standard Tests
-
-```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run specific tests
-python -m pytest tests/test_environment.py -v
-python -m pytest tests/test_integration.py -v
-python -m pytest tests/test_llm_integration.py -v
-python -m pytest tests/test_action_masking.py -v
-```
-
-**Test Coverage:**
-- Environment validation
-- Action masking correctness
-- Integration workflows
-- LLM integration
-- Market selection
-- Apex compliance
+**Testing Framework Coverage:**
+- Validates environment setup and observation flow
+- Exercises action masking correctness
+- Runs end-to-end RL + LLM integration loops
+- Checks market detection and data hooks
+- Confirms Apex compliance checkpoints
 
 ## Data Format
 
@@ -678,10 +600,10 @@ Or use CPU:
 
 ### Import Errors
 
-Ensure TensorTrade is installed:
+Reinstall the required dependencies:
 
 ```bash
-python setup.py install
+python -m pip install -r requirements.txt
 ```
 
 ### Model Not Found (Phase 2)
@@ -744,7 +666,7 @@ Target metrics for successful training:
 - Monitor GPU/CPU usage during training
 - Use "Continue Training" to resume interrupted sessions
 - Phase 2 automatically finds your newest Phase 1 model
-- Run tests before committing changes: `pytest tests/ -v`
+- Before long runs, exercise the pipeline test harness: `python src/testing_framework.py --mode pipeline --market NQ`
 
 ## Common Workflows
 
@@ -807,9 +729,6 @@ python src/testing_framework.py --mode hardware_maximized --market NQ
 
 # Run pipeline test
 python src/testing_framework.py --mode pipeline --market NQ
-
-# Run unit tests
-python -m pytest tests/ -v
 ```
 
 ## Technology Stack
@@ -823,7 +742,7 @@ python -m pytest tests/ -v
 - **Data Processing**: Pandas, NumPy, SciPy, Scikit-Learn
 - **Visualization**: Matplotlib, Plotly, TensorBoard
 - **UI**: Colorama, tqdm, rich
-- **Testing**: pytest
+- **Testing**: Custom testing_framework + pyright type checks
 
 ## License
 
@@ -831,11 +750,11 @@ Apache License 2.0 (inherited from TensorTrade)
 
 ## Contributing
 
-1. Run tests before committing: `pytest tests/ -v`
-2. Follow existing code style
-3. Update documentation for new features
-4. Ensure Apex compliance for any trading logic changes
-5. Update CHANGELOG.md with changes
+1. Validate end-to-end flow: `python src/testing_framework.py --mode pipeline --market NQ`
+2. Run static checks: `pyright`
+3. Follow existing code style (PEP 8 + type hints)
+4. Document user-facing changes in this README
+5. Update `changelog.md` with a concise summary
 
 ## Support & Contact
 
@@ -844,9 +763,9 @@ Apache License 2.0 (inherited from TensorTrade)
 
 For technical issues:
 1. Check logs in `logs/` directory
-2. Review `docs/Apex-Rules.md` for compliance questions
-3. Run tests to diagnose issues: `pytest tests/ -v`
-4. Review `docs/FIXES_SUMMARY.md` for recent bug fixes
+2. Validate data integrity: `python src/validate_data_quality.py --market NQ`
+3. Run the pipeline test harness: `python src/testing_framework.py --mode pipeline --market NQ`
+4. Review `changelog.md` for the latest fixes and behavioral notes
 
 ## Version
 

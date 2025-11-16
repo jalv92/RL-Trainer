@@ -18,17 +18,35 @@ Based on: train_phase2.py with LLM integration
 """
 
 import os
+import platform
+import shutil
+from pathlib import Path
+from typing import Optional
 
-# Limit math/BLAS thread pools before heavy numerical imports
+
+def _detect_thread_cap() -> int:
+    """Auto-detect a reasonable BLAS thread cap based on CPU size."""
+    try:
+        # Prefer affinity-aware measurement when available.
+        cpu_count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpu_count = os.cpu_count() or 2
+    return max(1, cpu_count - 1)
+
+
+# Limit math/BLAS thread pools before heavy numerical imports. Allow override via env var.
 try:
-    _THREAD_LIMIT_INT = max(1, int(os.environ.get("TRAINER_MAX_BLAS_THREADS", "1")))
+    _THREAD_LIMIT_INT = max(
+        1,
+        int(os.environ.get("TRAINER_MAX_BLAS_THREADS", str(_detect_thread_cap()))),
+    )
 except ValueError:
-    _THREAD_LIMIT_INT = 1
+    _THREAD_LIMIT_INT = _detect_thread_cap()
 _THREAD_LIMIT_STR = str(_THREAD_LIMIT_INT)
 
 for _env_var in (
     "OPENBLAS_NUM_THREADS",
-    "OMP_NUM_THREADS", 
+    "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
@@ -50,6 +68,7 @@ try:
         torch.set_num_threads(_THREAD_LIMIT_INT)
 except (TypeError, ValueError):
     torch.set_num_threads(1)
+TORCH_THREADS_EFFECTIVE = torch.get_num_threads()
 
 from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
@@ -68,6 +87,13 @@ from feature_engineering import add_market_regime_features
 from model_utils import detect_models_in_folder, detect_available_markets, select_market_for_training
 from market_specs import get_market_spec
 from metadata_utils import read_metadata, write_metadata
+from action_mask_utils import get_action_masks, ensure_vecenv_action_masks
+from self_correcting_init import init_self_correcting_system
+
+# CHECKPOINT MANAGEMENT (replaces old SafeCheckpointCallback)
+from checkpoint_manager import DynamicCheckpointManager, MetricTrackingEvalCallback, EvalMetricHook
+from checkpoint_retention import CheckpointRetentionManager
+from stable_baselines3.common.callbacks import CallbackList
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':
@@ -107,6 +133,87 @@ def get_effective_num_envs(requested_envs: int) -> int:
     return effective
 
 
+def supports_subproc_vec_env() -> bool:
+    """
+    Detect whether SubprocVecEnv is safe on this host.
+
+    Windows / WSL builds often struggle with forked environments, so we disable
+    it automatically there while keeping it enabled for native Linux pods.
+    """
+    if os.name == 'nt':
+        return False
+    release = platform.release().lower()
+    return 'microsoft' not in release and 'wsl' not in release
+
+
+def compute_env_start_index(data_length: int, config: dict, rank: int) -> Optional[int]:
+    """
+    Compute deterministic start index for an environment when randomization is disabled.
+
+    Returns:
+        int or None if not enough data.
+    """
+    min_start = config.get('window_size', 20)
+    min_episode_bars = max(config.get('min_episode_bars', 1500), 10)
+    max_start = data_length - min_episode_bars
+    if max_start <= min_start:
+        return max(min_start, 0)
+
+    if config.get('deterministic_env_offsets', False):
+        n_envs = max(1, config.get('n_envs', 1))
+        spacing = max(1, (max_start - min_start) // n_envs or 1)
+        start = min_start + spacing * rank
+        return min(max(start, min_start), max_start)
+
+    seed = (config.get('start_offset_seed', 0) + rank) or None
+    rng = np.random.default_rng(seed)
+    return int(rng.integers(min_start, max_start + 1))
+
+
+def _log_disk_warning(label: str, path: str, exc: Exception) -> None:
+    """Log disk usage when checkpoint/eval saving fails."""
+    safe_print(f"[{label}] Failed to save model: {exc}")
+    try:
+        target = Path(path)
+        disk_root = target if target.is_dir() else target.parent
+        usage = shutil.disk_usage(disk_root)
+        free_gb = usage.free / (1024 ** 3)
+        total_gb = usage.total / (1024 ** 3)
+        safe_print(f"[{label}] Disk usage at {disk_root}: {free_gb:.2f} GB free / {total_gb:.2f} GB total")
+    except Exception:
+        pass
+
+
+class SafeEvalCallback(EvalCallback):
+    """Eval callback that tolerates disk full errors."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._disable_saves = False
+
+    def _save_model(self) -> None:
+        if self._disable_saves:
+            return
+        try:
+            super()._save_model()
+        except (OSError, RuntimeError) as exc:
+            if "No space left" in str(exc):
+                _log_disk_warning("EVAL", self.best_model_save_path, exc)
+                self._disable_saves = True
+            else:
+                raise
+
+
+# DEPRECATED: SafeCheckpointCallback replaced by DynamicCheckpointManager
+# The new checkpoint manager includes disk-full protection plus:
+# - Adaptive save intervals (grows as training stabilizes)
+# - Event-driven triggers (best metric, phase boundaries)
+# - Rich metadata with metrics embedded in filenames
+# - Automatic retention cleanup
+# Import from checkpoint_manager for compatibility:
+# from checkpoint_manager import DynamicCheckpointManager as SafeCheckpointCallback
+
+
 # Phase 3 Configuration
 PHASE3_CONFIG = {
     'total_timesteps': 5_000_000,  # 5M timesteps for hybrid training
@@ -134,8 +241,12 @@ PHASE3_CONFIG = {
     'window_size': 20,  # Same as Phase 2
     'second_data_enabled': False,
     # Parallel environments
-    'n_envs': 4,  # Reduced from Phase 2 due to LLM overhead
-    'vec_env_cls': 'dummy',  # 'subproc' or 'dummy' (dummy for WSL2 compatibility)
+    'n_envs': 8,  # Higher default to better utilize large pods (auto-capped per host)
+    'vec_env_cls': 'subproc',  # 'subproc' or 'dummy' (auto-fallback on Windows/WSL)
+    'min_episode_bars': 1500,  # Minimum remaining bars per episode after start offset
+    'randomize_start_offsets': True,  # Randomize episode starts each reset
+    'deterministic_env_offsets': False,  # If True, spread envs evenly instead of random
+    'start_offset_seed': 42,  # Base seed for deterministic offsets
     # Callbacks
     'eval_freq': 10000,
     'save_freq': 50000,
@@ -149,7 +260,6 @@ PHASE3_CONFIG = {
     # LLM-specific
     'llm_config_path': "./config/llm_config.yaml",
     'use_llm_features': True,  # Enable 261D observations
-    'mock_llm': False,  # Set to True for testing without GPU
 
     # Adapter-specific (NEW - for Phase 2 → Phase 3 transfer learning)
     'freeze_phase2_initially': True,  # Freeze Phase 2 weights during adapter warmup
@@ -230,6 +340,9 @@ def create_phase3_env(env_data, second_data=None, market_name=None, config=None,
     # Get market specification
     market_spec = get_market_spec(market_name) if market_name else None
     
+    # Determine deterministic start index (used when randomization disabled)
+    deterministic_start = compute_env_start_index(len(env_data), config, rank)
+
     # Create environment
     env = TradingEnvironmentPhase3LLM(
         data=env_data,
@@ -246,16 +359,26 @@ def create_phase3_env(env_data, second_data=None, market_name=None, config=None,
         tighten_sl_step=0.5,
         extend_tp_step=1.0,
         trailing_activation_profit=1.0,
-        hybrid_agent=hybrid_agent  # PHASE 1 & 2: For outcome tracking
+        hybrid_agent=hybrid_agent,  # PHASE 1 & 2: For outcome tracking
+        start_index=deterministic_start,
+        randomize_start_offsets=config.get('randomize_start_offsets', True),
+        min_episode_bars=config.get('min_episode_bars', 1500)
     )
-    
-    # Add action masking wrapper
-    env = ActionMasker(env, lambda env: env.action_masks())
-    
-    # Wrap with Monitor for logging
+
+    # Validation: Ensure environment has randomization support
+    assert hasattr(env, 'randomize_start_offsets'), \
+        "Environment missing randomization support"
+    assert hasattr(env, 'min_episode_bars'), \
+        "Environment missing min_episode_bars attribute"
+    assert hasattr(env, '_determine_episode_start'), \
+        "Environment missing _determine_episode_start method"
+
+    # Wrap with Monitor first for logging/episode stats
     env = Monitor(env)
-    
-    return env
+
+    # Ensure ActionMasker is the outermost layer so MaskablePPO (and Gym)
+    # can access action_masks without deprecated attribute hops.
+    return ActionMasker(env, lambda env: get_action_masks(env))
 
 
 def _unwrap_gym_env(env):
@@ -600,7 +723,7 @@ def setup_model(env, config=None, load_path=None):
     return model
 
 
-def create_callbacks(model, eval_env, hybrid_agent, config=None):
+def create_callbacks(model, eval_env, hybrid_agent, market_name, config=None):
     """
     Create training callbacks.
     
@@ -608,6 +731,7 @@ def create_callbacks(model, eval_env, hybrid_agent, config=None):
         model: Training model
         eval_env: Evaluation environment
         hybrid_agent: HybridTradingAgent instance
+        market_name: Market symbol being trained
         config: Configuration dictionary
     
     Returns:
@@ -617,29 +741,47 @@ def create_callbacks(model, eval_env, hybrid_agent, config=None):
         config = PHASE3_CONFIG
     
     callbacks = []
-    
-    # Evaluation callback
-    eval_callback = EvalCallback(
+
+    # Initialize self-correcting components shared across phases
+    registry, forecaster, metric_tracker, policy_controller, corrective_manager = init_self_correcting_system(
+        market=market_name,
+        phase=3,
+        config_path='config/checkpoint_config.yaml',
+        verbose=True
+    )
+    metric_tracker.set_seed(42)  # Match training seed
+    metric_hook = EvalMetricHook(metric_tracker)
+
+    # Evaluation callback with metric hook
+    # Note: Phase 3 doesn't use early stopping, so only metric_hook is needed
+    eval_callback = SafeEvalCallback(
         eval_env,
         best_model_save_path=config['model_save_path'],
         log_path="./logs/phase3_eval",
         eval_freq=config['eval_freq'],
         deterministic=True,
         render=False,
-        verbose=1
+        verbose=1,
+        callback_after_eval=metric_hook
     )
     callbacks.append(eval_callback)
-    
-    # Checkpoint callback
-    checkpoint_callback = CheckpointCallback(
-        save_freq=config['save_freq'],
-        save_path=config['model_save_path'],
-        name_prefix="phase3_hybrid",
-        save_replay_buffer=False,
-        save_vecnormalize=True,
-        verbose=1
+
+    # IMPROVED: Dynamic checkpoint manager with adaptive intervals and event-driven saves
+    checkpoint_manager = DynamicCheckpointManager(
+        market=market_name,
+        phase=3,
+        seed=42,
+        config_path='config/checkpoint_config.yaml',
+        metric_tracker=metric_tracker,
+        target_timesteps=config['total_timesteps'],
+        verbose=True,
+        registry=registry
     )
-    callbacks.append(checkpoint_callback)
+    safe_print(f"[CHECKPOINT] Dynamic checkpoint manager initialized")
+    safe_print(f"[CHECKPOINT] Base interval: 10K steps (adaptive, LLM-optimized)")
+    safe_print(f"[CHECKPOINT] Event triggers: periodic, best, phase_end, interrupt")
+    safe_print(f"[CHECKPOINT] Disk-full protection: enabled")
+    callbacks.append(checkpoint_manager)
     
     # KL Divergence callback
     kl_callback = KLDivergenceCallback(log_freq=1000, target_kl=config['target_kl'])
@@ -652,6 +794,12 @@ def create_callbacks(model, eval_env, hybrid_agent, config=None):
         verbose=1
     )
     callbacks.append(llm_callback)
+
+    # Optional self-correcting callbacks (policy controller + corrective manager)
+    if policy_controller is not None:
+        callbacks.append(policy_controller)
+    if corrective_manager is not None:
+        callbacks.append(corrective_manager)
     
     # ============================================
     # PHASE 1 IMPLEMENTATION: Adaptive Fusion
@@ -727,7 +875,7 @@ def create_callbacks(model, eval_env, hybrid_agent, config=None):
         # PHASE 2 IMPLEMENTATION: LLM Fine-Tuning
         # ============================================
         
-        class LLMFineTuningCallback:
+        class LLMFineTuningCallback(BaseCallback):
             """
             Callback to fine-tune LLM during training.
             
@@ -737,7 +885,8 @@ def create_callbacks(model, eval_env, hybrid_agent, config=None):
             - Monitor LLM improvement via agreement rate with optimal actions
             """
             
-            def __init__(self, llm_model, train_freq=5000, batch_size=8):
+            def __init__(self, llm_model, train_freq=5000, batch_size=8, verbose=0):
+                super().__init__(verbose)
                 self.llm_model = llm_model
                 self.train_freq = train_freq
                 self.batch_size = batch_size
@@ -745,7 +894,7 @@ def create_callbacks(model, eval_env, hybrid_agent, config=None):
                 self.llm_losses = []
                 self.llm_accuracies = []
             
-            def on_step(self) -> bool:
+            def _on_step(self) -> bool:
                 self.steps += 1
                 
                 # Fine-tune LLM periodically
@@ -767,7 +916,7 @@ def create_callbacks(model, eval_env, hybrid_agent, config=None):
                 
                 return True
             
-            def on_rollout_end(self):
+            def _on_rollout_end(self):
                 """Called after each rollout - update outcomes."""
                 # Note: Outcome updating happens in hybrid_agent during episode
                 pass
@@ -853,10 +1002,17 @@ def create_callbacks(model, eval_env, hybrid_agent, config=None):
         else:
             safe_print("[CALLBACK] Adapter warmup skipped (no adapter in policy)")
 
-    return callbacks
+    return callbacks, checkpoint_manager
 
 
-def train_phase3(market_name=None, test_mode=False, continue_training=False, model_path=None):
+def train_phase3(
+    market_name=None,
+    test_mode=False,
+    continue_training=False,
+    model_path=None,
+    n_envs: Optional[int] = None,
+    vec_env_cls: Optional[str] = None,
+):
     """
     Main Phase 3 training function.
     
@@ -877,8 +1033,28 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
         config['eval_freq'] = 1000
         config['save_freq'] = 5000
         config['n_envs'] = 2  # Reduce parallel envs
-        config['mock_llm'] = True  # Use mock LLM for testing
         safe_print("[CONFIG] Test mode enabled - reduced settings")
+
+    if n_envs is not None:
+        config['n_envs'] = max(1, n_envs)
+    if vec_env_cls is not None:
+        config['vec_env_cls'] = vec_env_cls
+
+    requested_envs = config.get('n_envs', 1)
+    config['n_envs'] = get_effective_num_envs(requested_envs)
+    if config['n_envs'] != requested_envs:
+        safe_print(
+            f"[ENV] Requested {requested_envs} envs, capped to {config['n_envs']} based on host CPU"
+        )
+
+    if config.get('vec_env_cls') == 'subproc' and not supports_subproc_vec_env():
+        safe_print("[ENV] SubprocVecEnv unsupported on this host, falling back to DummyVecEnv")
+        config['vec_env_cls'] = 'dummy'
+
+    safe_print(
+        f"[THREADS] BLAS threads={_THREAD_LIMIT_INT} | PyTorch threads={TORCH_THREADS_EFFECTIVE} "
+        "(override via TRAINER_MAX_BLAS_THREADS / PYTORCH_NUM_THREADS)"
+    )
     
     # Market selection
     if market_name is None:
@@ -909,14 +1085,12 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
     safe_print("[LLM] Initializing LLM advisor...")
     try:
         llm_model = LLMReasoningModule(
-            config_path=config['llm_config_path'],
-            mock_mode=config['mock_llm']
+            config_path=config['llm_config_path']
         )
         safe_print("[OK] LLM advisor initialized")
     except Exception as e:
         safe_print(f"[ERROR] Failed to initialize LLM: {e}")
-        if not config['mock_llm']:
-            safe_print("[INFO] Consider setting mock_llm=True for testing")
+        safe_print("[INFO] Ensure Phi-3-mini-4k-instruct model is downloaded to project folder")
         return None
 
     # CRITICAL FIX: Create hybrid agent BEFORE environments
@@ -964,6 +1138,7 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
         try:
             safe_print(f"[VECNORM] Loading Phase 2 normalization stats from {phase2_vecnorm_path}")
             train_env = VecNormalize.load(phase2_vecnorm_path, train_env)
+            train_env = ensure_vecenv_action_masks(train_env)
             train_env.training = True  # Enable training mode
             train_env.norm_obs = True
             train_env.norm_reward = True
@@ -987,6 +1162,7 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
             gamma=config['gamma'],
             epsilon=1e-8
         )
+        train_env = ensure_vecenv_action_masks(train_env)
         safe_print("[VECNORM] Created fresh normalization wrapper")
 
     registry_ready = register_training_envs(train_env, config['n_envs'], hybrid_agent)
@@ -996,6 +1172,7 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
     # Evaluation environment (must match training env wrapper structure)
     eval_env = DummyVecEnv([lambda: create_phase3_env(env_data, second_data, market_name, config, rank=999, hybrid_agent=None)])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    eval_env = ensure_vecenv_action_masks(eval_env)
 
     # CRITICAL FIX: Load or create model with hybrid policy (enables LLM during training)
     if continue_training and model_path:
@@ -1036,19 +1213,19 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
     # Recreate evaluation environment with hybrid agent
     eval_env = DummyVecEnv([lambda: create_phase3_env(env_data, second_data, market_name, config, rank=999, hybrid_agent=hybrid_agent)])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    eval_env = ensure_vecenv_action_masks(eval_env)
 
     safe_print("[ENV] Hybrid agent communication channels established")
-    
+
     # Create callbacks
-    callbacks = create_callbacks(model, eval_env, hybrid_agent, config)
-    
+    callbacks, checkpoint_manager = create_callbacks(model, eval_env, hybrid_agent, market_name, config)
+
     # Training
     safe_print("=" * 70)
     safe_print("Starting Phase 3 Hybrid Training")
     safe_print(f"Total timesteps: {config['total_timesteps']:,}")
     safe_print(f"Parallel environments: {config['n_envs']}")
     safe_print(f"LLM features: {'Enabled' if config['use_llm_features'] else 'Disabled'}")
-    safe_print(f"Mock LLM: {'Yes' if config['mock_llm'] else 'No'}")
     safe_print("=" * 70)
     
     try:
@@ -1058,11 +1235,24 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
             progress_bar=True,
             tb_log_name=f"phase3_hybrid_{market_name}"
         )
-        
+
+        # Save phase_end checkpoint after successful training
+        checkpoint_manager.on_phase_end()
+
         safe_print("\n" + "=" * 70)
         safe_print("✅ Phase 3 Training Completed Successfully!")
         safe_print("=" * 70)
-        
+
+        # Run checkpoint retention cleanup
+        safe_print("\n[CHECKPOINT] Running checkpoint retention cleanup...")
+        try:
+            retention_manager = CheckpointRetentionManager('config/checkpoint_config.yaml')
+            checkpoint_dir = f'./models/phase3_hybrid/{market_name}/checkpoints/'
+            retention_manager.prune_checkpoints(checkpoint_dir, dry_run=False, verbose=False)
+            safe_print("[CHECKPOINT] Retention cleanup completed")
+        except Exception as e:
+            safe_print(f"[WARNING] Checkpoint retention cleanup failed: {e}")
+
         # Save final model
         final_model_dir = config['model_save_path']
         os.makedirs(final_model_dir, exist_ok=True)
@@ -1073,10 +1263,10 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
         if vecnorm_dir:
             os.makedirs(vecnorm_dir, exist_ok=True)
         train_env.save(vecnorm_path)
-        
+
         safe_print(f"[SAVE] Model saved to: {final_model_path}")
         safe_print(f"[SAVE] VecNormalize saved to: {config['vecnormalize_path']}")
-        
+
         # Print final statistics
         final_stats = hybrid_agent.get_stats()
         safe_print("\n[STATS] Final Hybrid Agent Statistics:")
@@ -1084,7 +1274,7 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
         safe_print(f"  Agreement rate: {final_stats.get('agreement_pct', 0):.1f}%")
         safe_print(f"  Risk veto rate: {final_stats.get('risk_veto_pct', 0):.1f}%")
         safe_print(f"  LLM query rate: {final_stats.get('llm_query_rate', 0):.1f}%")
-        
+
         # Print LLM statistics
         llm_stats = hybrid_agent.get_llm_stats()
         if llm_stats.get('total_queries', 0) > 0:
@@ -1093,22 +1283,29 @@ def train_phase3(market_name=None, test_mode=False, continue_training=False, mod
             safe_print(f"  Average latency: {llm_stats.get('avg_latency_ms', 0):.1f}ms")
             safe_print(f"  Error rate: {llm_stats.get('error_rate', 0):.1f}%")
             safe_print(f"  Cache hit rate: {llm_stats.get('cache_hit_rate', 0):.1f}%")
-        
+
         return model
-        
+
     except KeyboardInterrupt:
         safe_print("\n[INTERRUPT] Training interrupted by user")
-        
-        # Save checkpoint
+        safe_print("[CHECKPOINT] Saving interrupt checkpoint...")
+        checkpoint_manager.on_interrupt()
+
+        # Also save final model (legacy support)
         checkpoint_path = f"{config['model_save_path']}/phase3_hybrid_interrupted"
         model.save(checkpoint_path)
         train_env.save(config['vecnormalize_path'])
-        
-        safe_print(f"[SAVE] Checkpoint saved to: {checkpoint_path}")
+
+        safe_print(f"[SAVE] Legacy checkpoint saved to: {checkpoint_path}")
         return model
-        
+
     except Exception as e:
         safe_print(f"\n[ERROR] Training failed: {e}")
+        # Save interrupt checkpoint on exception
+        try:
+            checkpoint_manager.on_interrupt()
+        except Exception:
+            pass
         import traceback
         traceback.print_exc()
         return None
@@ -1132,21 +1329,20 @@ def main():
     parser.add_argument('--continue', dest='continue_training', action='store_true',
                        help='Continue from existing model')
     parser.add_argument('--model-path', type=str, help='Path to model to continue from')
-    parser.add_argument('--mock-llm', action='store_true', help='Use mock LLM (no GPU required)')
     parser.add_argument('--non-interactive', action='store_true', help='Run without prompts')
-    
+    parser.add_argument('--n-envs', type=int, help='Override number of parallel environments')
+    parser.add_argument('--vec-env', choices=['dummy', 'subproc'], help='Select vectorized env type')
+
     args = parser.parse_args()
-    
-    # Override config with CLI args
-    if args.mock_llm:
-        PHASE3_CONFIG['mock_llm'] = True
     
     # Run training
     model = train_phase3(
         market_name=args.market,
         test_mode=args.test,
         continue_training=args.continue_training,
-        model_path=args.model_path
+        model_path=args.model_path,
+        n_envs=args.n_envs,
+        vec_env_cls=args.vec_env
     )
     
     if model is None:
