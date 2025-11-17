@@ -50,6 +50,8 @@ from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
 # ACTION MASKING FIX: Import ActionMasker wrapper to enable action masking during training
 from sb3_contrib.common.wrappers import ActionMasker
+from sb3_contrib.common.maskable import utils as sb3_maskable_utils
+import sb3_contrib.ppo_mask.ppo_mask as sb3_ppo_mask_module
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, CallbackList
@@ -59,7 +61,11 @@ from feature_engineering import add_market_regime_features
 from model_utils import detect_models_in_folder, detect_available_markets, select_market_for_training
 from market_specs import get_market_spec
 from metadata_utils import read_metadata, write_metadata
-from action_mask_utils import get_action_masks, ensure_vecenv_action_masks
+from action_mask_utils import (
+    ActionMaskGymnasiumWrapper,
+    ActionMaskVecEnvWrapper,
+    get_action_masks as local_action_masks,
+)
 
 # CHECKPOINT MANAGEMENT
 from checkpoint_manager import DynamicCheckpointManager, MetricTrackingEvalCallback, EvalMetricHook
@@ -128,6 +134,154 @@ def get_effective_num_envs(requested_envs: int) -> int:
     return requested_envs
 
 
+def ensure_action_space(env, expected_actions: int, label: str = "ENV") -> None:
+    """
+    Ensure the provided environment exposes the expected number of discrete actions.
+    """
+    action_space = getattr(env, "action_space", None)
+    action_count = getattr(action_space, "n", None) if action_space is not None else None
+    if action_count != expected_actions:
+        raise RuntimeError(
+            f"[{label}] Action space mismatch: expected {expected_actions}, found {action_count}"
+        )
+    safe_print(f"[{label}] Action space verified: {action_count} actions")
+
+
+def log_action_mask_shape(env, expected_actions: int, label: str = "ENV") -> None:
+    """
+    Fetch action masks from a wrapped environment and verify their shape.
+    """
+    try:
+        masks = local_action_masks(env)
+    except AttributeError as err:
+        raise RuntimeError(f"[{label}] Unable to retrieve action masks: {err}") from err
+
+    masks = np.asarray(masks, dtype=bool)
+    if masks.ndim == 1:
+        masks = masks.reshape(1, -1)
+
+    if masks.shape[1] != expected_actions:
+        raise RuntimeError(
+            f"[{label}] Action mask width mismatch: expected {expected_actions}, found {masks.shape[1]}"
+        )
+
+    safe_print(f"[{label}] Mask shape verified: {masks.shape}")
+
+
+def mask_fn(env):
+    """
+    Resolve the innermost environment that exposes action_masks() and call it directly.
+    CRITICAL FIX: Prioritize TradingEnvironmentPhase2.action_masks() which returns 6-action masks.
+    """
+    from environment_phase2 import TradingEnvironmentPhase2
+    
+    # First, try to find the TradingEnvironmentPhase2 instance directly
+    current = env
+    visited = set()
+    
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        
+        # Check if this is the Phase2 environment
+        if isinstance(current, TradingEnvironmentPhase2):
+            masks = current.action_masks()
+            if masks is not None:
+                result = np.asarray(masks, dtype=bool)
+                # Verify we got 6 actions
+                if result.shape == (6,):
+                    return result
+                else:
+                    safe_print(f"[WARN] Phase2 env returned unexpected mask shape: {result.shape}")
+        
+        # Try unwrapped attribute (Gymnasium pattern)
+        unwrapped = getattr(current, "unwrapped", None)
+        if unwrapped and isinstance(unwrapped, TradingEnvironmentPhase2):
+            masks = unwrapped.action_masks()
+            if masks is not None:
+                result = np.asarray(masks, dtype=bool)
+                if result.shape == (6,):
+                    return result
+        
+        # Move to next wrapper layer
+        current = getattr(current, "env", None)
+    
+    # Fallback: Try generic action_masks method (but verify shape)
+    current = env
+    visited.clear()
+    
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        action_masks_fn = getattr(current, "action_masks", None)
+        if callable(action_masks_fn):
+            masks = action_masks_fn()
+            if masks is not None:
+                result = np.asarray(masks, dtype=bool)
+                # Only accept if it's 6 actions
+                if result.shape == (6,):
+                    return result
+        current = getattr(current, "env", None)
+    
+    # Last resort: Return all actions valid for 6-action space
+    safe_print("[WARN] Could not find Phase2 action_masks, returning all valid")
+    return np.ones(6, dtype=bool)
+
+
+def stable_mask_fetch(env) -> np.ndarray:
+    """
+    Replacement for sb3's get_action_masks that guarantees a 2D boolean tensor.
+    """
+    raw_vec_masks = None
+    raw_vec_get_masks = None
+    if hasattr(env, "env_method"):
+        try:
+            raw_vec_masks = env.env_method("action_masks")
+        except Exception:
+            raw_vec_masks = None
+        try:
+            raw_vec_get_masks = env.env_method("get_action_mask")
+        except Exception:
+            raw_vec_get_masks = None
+
+    masks = np.asarray(local_action_masks(env), dtype=bool)
+    if masks.ndim == 1:
+        masks = masks.reshape(1, -1)
+
+    num_envs = getattr(env, "num_envs", masks.shape[0])
+    if masks.shape[0] != num_envs and num_envs > 1:
+        if masks.shape[0] == 1:
+            masks = np.repeat(masks, num_envs, axis=0)
+        else:
+            masks = masks.reshape(num_envs, -1)
+
+    action_space = getattr(env, "action_space", None)
+    action_dim = getattr(action_space, "n", masks.shape[-1])
+    if masks.shape[-1] != action_dim:
+        # If mask only stores scalar validity (e.g., shape (n_envs,)), broadcast per action.
+        if masks.shape[-1] == 1:
+            masks = np.repeat(masks, action_dim, axis=-1)
+        else:
+            if raw_vec_masks is not None:
+                safe_print(f"[MASK][DEBUG] env_method masks: {raw_vec_masks}")
+            if raw_vec_get_masks is not None:
+                safe_print(f"[MASK][DEBUG] env_method get_action_mask: {raw_vec_get_masks}")
+            safe_print(
+                f"[MASK][DEBUG] Raw mask shape {masks.shape} | action_dim={action_dim} | num_envs={num_envs}"
+            )
+            safe_print(f"[MASK][DEBUG] Mask sample: {masks}")
+            raise RuntimeError(
+                f"[MASK] Unexpected mask width {masks.shape[-1]} (expected {action_dim})"
+            )
+
+    return masks.astype(bool, copy=False)
+
+
+# Monkey-patch sb3 to use the stable mask fetcher everywhere
+sb3_maskable_utils.get_action_masks = stable_mask_fetch
+sb3_ppo_mask_module.get_action_masks = stable_mask_fetch
+# Local alias for logging convenience
+sb3_get_action_masks = stable_mask_fetch
+
+
 # Check progress bar availability
 PROGRESS_BAR_AVAILABLE = False
 try:
@@ -146,6 +300,7 @@ PHASE2_CONFIG = {
     # ACTION MASKING FIX: Increased to 10M for better convergence with action masking
     'total_timesteps': 10_000_000,  # 10M - extended training for proper action learning
     'num_envs': 80,  # INCREASED for RTX 4000 Ada 20GB: excellent parallelization
+    'action_space': 6,  # RL FIX #10: explicit 6-action configuration
 
     # ACTION MASKING FIX: Observation space is now 228 (was 225)
     # 220 market + 5 position + 3 validity features (can_enter, can_manage, has_position)
@@ -165,7 +320,7 @@ PHASE2_CONFIG = {
     'gamma': 0.99,
     'gae_lambda': 0.95,
     'clip_range': 0.2,
-    'ent_coef': 0.06,  # FIXED: Increased for 9-action exploration (was 0.015/0.03)
+    'ent_coef': 0.06,  # FIXED: Tuned to keep exploration healthy across 6 discrete actions
     'vf_coef': 0.25,  # FIX: DOWN from 0.5 - reduce value function overfitting
     'max_grad_norm': 0.5,
 
@@ -493,22 +648,6 @@ class ActionDistributionCallback(CheckpointCallback):
                 self.invalid_action_count = 0
 
 
-def mask_fn(env):
-    """
-    ACTION MASKING FIX: Wrapper function to provide action masks to MaskablePPO.
-
-    This function is called by ActionMasker to get valid actions for current state.
-    Critical for preventing invalid action predictions during training.
-
-    Args:
-        env: The trading environment instance
-
-    Returns:
-        np.ndarray: Boolean mask where True = valid action
-    """
-    return get_action_masks(env)
-
-
 def make_env(data, second_data, env_id, config, market_spec):
     """
     Create Phase 2 environment factory with mixed episode lengths.
@@ -566,7 +705,8 @@ def make_env(data, second_data, env_id, config, market_spec):
         assert hasattr(env, '_determine_episode_start'), \
             "Environment missing _determine_episode_start method"
 
-        # Wrap with Monitor first for stats/loss tracking
+        # Wrap with Gymnasium-compatible action mask helper before monitoring
+        env = ActionMaskGymnasiumWrapper(env)
         env = Monitor(env)
 
         # IMPORTANT: ActionMasker must be the outermost wrapper so SB3's
@@ -626,7 +766,7 @@ def load_phase1_and_transfer(config, env):
 
     Strategy:
     1. Check if Phase 1 model exists
-    2. Create new Phase 2 model with expanded action space (9 actions)
+    2. Create new Phase 2 model with expanded action space (6 actions)
     3. Load Phase 1 weights into shared layers
     4. OPTIONAL: Apply small-world rewiring (Watts-Strogatz)
        - Preserves 95% of Phase 1 connections (high clustering)
@@ -735,14 +875,14 @@ def load_phase1_and_transfer(config, env):
         elif os.path.exists(config['phase1_vecnorm_path']):
             safe_print("[TRANSFER] [WARN] Phase 1 VecNormalize metadata not found; cannot verify market alignment")
 
-        # Create new Phase 2 model (9 actions with action masking)
-        safe_print("[TRANSFER] Creating Phase 2 model with expanded action space (9 actions + masking)...")
+        # Create new Phase 2 model (6 actions with action masking)
+        safe_print("[TRANSFER] Creating Phase 2 model with expanded action space (6 actions + masking)...")
         safe_print("[TRANSFER] RL FIX #4: Using MaskablePPO for efficient exploration")
 
         learning_rate = get_learning_rate(config)
 
         # RL FIX #7: Use fixed entropy coefficient (MaskablePPO doesn't support schedules)
-        ent_coef = 0.06  # FIXED: 4x higher for 9-action space exploration
+        ent_coef = 0.06  # FIXED: Keeps exploration balanced across the 6-action head
 
         # RL FIX #4: Use MaskablePPO instead of standard PPO
         phase2_model = MaskablePPO(
@@ -849,7 +989,7 @@ def load_phase1_and_transfer(config, env):
             except Exception as e:
                 safe_print(f"  [!] Warning: Could not transfer all value layers: {e}")
 
-            # Note: Action head (3->9 actions) is left with random initialization
+            # Note: Action head (3->6 actions) is left with random initialization
             # This allows the model to learn new actions while preserving pattern knowledge
 
         safe_print("[TRANSFER] [OK] Transfer learning complete!")
@@ -969,7 +1109,9 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
         safe_print(f"[CONFIG] Parallel envs (effective): {num_envs}")
     safe_print(f"[SYSTEM] BLAS threads per process: {os.environ.get('OPENBLAS_NUM_THREADS', 'unknown')}")
     safe_print(f"[CONFIG] Network: {PHASE2_CONFIG['policy_layers']}")
-    safe_print(f"[CONFIG] Action space: 6 (RL Fix #10: simplified from 9 to 6)")
+    safe_print(
+        f"[CONFIG] Action space: {PHASE2_CONFIG['action_space']} (RL Fix #10: simplified from 9 to 6)"
+    )
     safe_print(f"[CONFIG] Device: {PHASE2_CONFIG['device']}")
     safe_print(f"[CONFIG] Position size: {PHASE2_CONFIG['position_size']} contracts (full)")
     safe_print(f"[CONFIG] Trailing DD: ${PHASE2_CONFIG['trailing_dd_limit']:,} (strict Apex)")
@@ -988,14 +1130,25 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
     safe_print(f"\n[ENV] Creating {num_envs} Phase 2 TRAINING environments...")
     env_fns = [make_env(train_data, train_second_data, i, PHASE2_CONFIG, market_spec) for i in range(num_envs)]
 
-    if num_envs > 1:
+    use_subproc = num_envs > 1 and os.name != "nt"
+    if use_subproc:
         env = SubprocVecEnv(env_fns)
     else:
+        if num_envs > 1:
+            safe_print("[ENV] Windows detected - using DummyVecEnv for mask stability")
         env = DummyVecEnv(env_fns)
 
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
-    env = ensure_vecenv_action_masks(env)
+    env = ActionMaskVecEnvWrapper(env)
     safe_print("[ENV] [OK] Phase 2 training environments created")
+    safe_print("[VALIDATION] Verifying training environment action space and mask shapes...")
+    ensure_action_space(env, PHASE2_CONFIG['action_space'], label="TRAIN")
+    log_action_mask_shape(env, PHASE2_CONFIG['action_space'], label="TRAIN")
+    try:
+        sb3_masks = sb3_get_action_masks(env)
+        safe_print(f"[TRAIN] SB3 mask tensor shape: {sb3_masks.shape}")
+    except Exception as mask_err:
+        safe_print(f"[TRAIN][ERROR] Unable to fetch SB3 masks: {mask_err}")
 
     # Create VALIDATION environment (use VAL data - CRITICAL FIX)
     safe_print("[EVAL] Creating VALIDATION environment (unseen data)...")
@@ -1015,12 +1168,20 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
             randomize_start_offsets=False,
             min_episode_bars=PHASE2_CONFIG.get('min_episode_bars', 1500)
         )
-        monitored_env = Monitor(base_env)
+        wrapped_env = ActionMaskGymnasiumWrapper(base_env)
+        monitored_env = Monitor(wrapped_env)
         return ActionMasker(monitored_env, mask_fn)
 
     eval_env = DummyVecEnv([_make_eval_env])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-    eval_env = ensure_vecenv_action_masks(eval_env)
+    eval_env = ActionMaskVecEnvWrapper(eval_env)
+    ensure_action_space(eval_env, PHASE2_CONFIG['action_space'], label="EVAL")
+    log_action_mask_shape(eval_env, PHASE2_CONFIG['action_space'], label="EVAL")
+    try:
+        eval_sb3_masks = sb3_get_action_masks(eval_env)
+        safe_print(f"[EVAL] SB3 mask tensor shape: {eval_sb3_masks.shape}")
+    except Exception as mask_err:
+        safe_print(f"[EVAL][ERROR] Unable to fetch SB3 masks: {mask_err}")
     # Transfer learning from Phase 1
     model = load_phase1_and_transfer(PHASE2_CONFIG, env)
 
@@ -1030,7 +1191,7 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
         safe_print("[MODEL] RL FIX #4: Using MaskablePPO for efficient exploration")
 
         # RL FIX #7: Use fixed entropy coefficient (MaskablePPO doesn't support schedules)
-        ent_coef = 0.06  # FIXED: 4x higher for 9-action space exploration
+        ent_coef = 0.06  # FIXED: Keeps exploration balanced across the 6-action head
 
         # RL FIX #4: Use MaskablePPO instead of standard PPO
         model = MaskablePPO(

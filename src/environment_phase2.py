@@ -164,6 +164,10 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             'market_symbol': getattr(self, 'market_symbol', None),
         })
 
+        # Prime initial action mask so wrappers receive a valid mask immediately
+        self.action_masks()
+        self._attach_action_mask(info)
+
         # Phase 2 specific position management parameters are already set in __init__
         # No need to re-assign them here
 
@@ -258,11 +262,11 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                 'num_trades': self.num_trades,
                 'balance': self.balance,
                 'done_reason': 'data_exhausted',
-                'action_mask': self._last_action_mask_as_list(),
                 'observation_quality': self._observation_quality(obs),
                 'step_index': self.current_step,
                 'remaining_bars': 0,
             }
+            self._attach_action_mask(info)
             self.last_done_reason = 'data_exhausted'
             return obs, 0.0, False, True, info
 
@@ -302,11 +306,11 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
                 'position': self.position,
                 'invalid_action': True,
                 'action': action,
-                'action_mask': action_mask.tolist(),
                 'reason': f"Action {action} invalid for position={self.position}",
                 'balance': self.balance,
                 'step_index': self.current_step,
             }
+            self._attach_action_mask(info)
             # DO NOT execute invalid action - return current state (but time advanced)
             return obs, reward, False, truncated, info
 
@@ -529,7 +533,6 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             'num_trades': self.num_trades,
             'balance': self.balance,
             'unrealized_pnl': unrealized_pnl,
-            'action_mask': self._last_action_mask_as_list(),
             'observation_quality': self._observation_quality(obs),
             'step_index': self.current_step,
             'prev_step_index': self.current_step - 1,
@@ -540,6 +543,7 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             'episode_bars': self.current_step - self._episode_start_index,  # DIAGNOSTIC
             'trailing_dd_level': self.trailing_dd_level,  # DIAGNOSTIC
         }
+        self._attach_action_mask(info)
 
         if done_reason:
             self.last_done_reason = done_reason
@@ -551,6 +555,11 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
         if self.last_action_mask is None:
             return None
         return self.last_action_mask.astype(bool).tolist()
+
+    def _attach_action_mask(self, info: Dict) -> None:
+        mask_list = self._last_action_mask_as_list()
+        if mask_list is not None:
+            info['action_mask'] = mask_list
 
     def _observation_quality(self, obs: np.ndarray) -> Dict[str, float]:
         if obs is None:
@@ -802,7 +811,9 @@ class TradingEnvironmentPhase2(TradingEnvironmentPhase1):
             # Disable trailing: only if currently enabled
             mask[5] = self.trailing_stop_active
 
-        return mask
+        mask = mask.astype(bool, copy=True)
+        self.last_action_mask = mask.copy()
+        return self.last_action_mask.copy()
 
     # Phase 2 now uses unified _calculate_apex_reward() inherited from Phase 1
     # No separate reward function needed - pm_action parameter handles Phase 2 bonuses

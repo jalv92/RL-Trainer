@@ -34,6 +34,28 @@ def _detect_thread_cap() -> int:
     return max(1, cpu_count - 1)
 
 
+def _ensure_phase3_directories(config, market_name: str) -> None:
+    """Ensure all directories referenced by Phase 3 exist before training starts."""
+    dirs = set()
+    vecnorm_path = config.get("vecnormalize_path")
+    if vecnorm_path:
+        dirs.add(Path(vecnorm_path).parent)
+
+    model_dir = Path(config.get("model_save_path", "./models/phase3_hybrid"))
+    dirs.add(model_dir)
+    phase_dir = Path("./models/phase3_hybrid") / market_name
+    dirs.add(phase_dir)
+    dirs.add(phase_dir / "checkpoints")
+    dirs.add(Path("./models/vecnormalize"))
+    dirs.add(Path("./tensorboard_logs"))
+    dirs.add(Path("./tensorboard_logs/phase2"))
+    dirs.add(Path("./tensorboard_logs/phase3"))
+
+    for directory in dirs:
+        if directory and not directory.exists():
+            directory.mkdir(parents=True, exist_ok=True)
+
+
 # Limit math/BLAS thread pools before heavy numerical imports. Allow override via env var.
 try:
     _THREAD_LIMIT_INT = max(
@@ -87,7 +109,11 @@ from feature_engineering import add_market_regime_features
 from model_utils import detect_models_in_folder, detect_available_markets, select_market_for_training
 from market_specs import get_market_spec
 from metadata_utils import read_metadata, write_metadata
-from action_mask_utils import get_action_masks, ensure_vecenv_action_masks
+from action_mask_utils import (
+    ActionMaskGymnasiumWrapper,
+    ActionMaskVecEnvWrapper,
+    get_action_masks,
+)
 from self_correcting_init import init_self_correcting_system
 
 # CHECKPOINT MANAGEMENT (replaces old SafeCheckpointCallback)
@@ -373,7 +399,8 @@ def create_phase3_env(env_data, second_data=None, market_name=None, config=None,
     assert hasattr(env, '_determine_episode_start'), \
         "Environment missing _determine_episode_start method"
 
-    # Wrap with Monitor first for logging/episode stats
+    # Wrap with Gymnasium-friendly action mask helper prior to monitoring
+    env = ActionMaskGymnasiumWrapper(env)
     env = Monitor(env)
 
     # Ensure ActionMasker is the outermost layer so MaskablePPO (and Gym)
@@ -1069,6 +1096,8 @@ def train_phase3(
         market_name = selected_market['market']
     
     safe_print(f"[MARKET] Training on: {market_name}")
+
+    _ensure_phase3_directories(config, market_name)
     
     # Data loading
     data_pattern = f"./data/{market_name}_D1M.csv"
@@ -1116,7 +1145,7 @@ def train_phase3(
             return lambda: create_phase3_env(
                 env_data, second_data, market_name, config, rank, hybrid_agent=None
             )
-        train_env = SubprocVecEnv([make_env(i) for i in range(config['n_envs'])])
+        base_vec_env = SubprocVecEnv([make_env(i) for i in range(config['n_envs'])])
         safe_print("[ENV] Using SubprocVecEnv (multiprocess) - hybrid_agent in main process only")
     else:
         # DummyVecEnv: Can pass hybrid_agent (single process, no pickling needed)
@@ -1124,8 +1153,10 @@ def train_phase3(
             return lambda: create_phase3_env(
                 env_data, second_data, market_name, config, rank, hybrid_agent=hybrid_agent
             )
-        train_env = DummyVecEnv([make_env(i) for i in range(config['n_envs'])])
+        base_vec_env = DummyVecEnv([make_env(i) for i in range(config['n_envs'])])
         safe_print("[ENV] Using DummyVecEnv (single process) - hybrid_agent enabled")
+
+    base_vec_env = ActionMaskVecEnvWrapper(base_vec_env)
 
     # Normalization with Phase 2 transfer (CRITICAL FIX #5)
     safe_print("[ENV] Setting up normalization...")
@@ -1134,11 +1165,12 @@ def train_phase3(
     phase2_vecnorm_path = config.get('phase2_vecnorm_path')
     loaded_phase2_vecnorm = False
 
+    train_env: Optional[VecNormalize] = None
+
     if phase2_vecnorm_path and os.path.exists(phase2_vecnorm_path):
         try:
             safe_print(f"[VECNORM] Loading Phase 2 normalization stats from {phase2_vecnorm_path}")
-            train_env = VecNormalize.load(phase2_vecnorm_path, train_env)
-            train_env = ensure_vecenv_action_masks(train_env)
+            train_env = VecNormalize.load(phase2_vecnorm_path, base_vec_env)
             train_env.training = True  # Enable training mode
             train_env.norm_obs = True
             train_env.norm_reward = True
@@ -1153,7 +1185,7 @@ def train_phase3(
     if not loaded_phase2_vecnorm:
         # Create fresh VecNormalize if Phase 2 stats not available
         train_env = VecNormalize(
-            train_env,
+            base_vec_env,
             training=True,
             norm_obs=True,
             norm_reward=True,
@@ -1162,7 +1194,6 @@ def train_phase3(
             gamma=config['gamma'],
             epsilon=1e-8
         )
-        train_env = ensure_vecenv_action_masks(train_env)
         safe_print("[VECNORM] Created fresh normalization wrapper")
 
     registry_ready = register_training_envs(train_env, config['n_envs'], hybrid_agent)
@@ -1171,8 +1202,8 @@ def train_phase3(
 
     # Evaluation environment (must match training env wrapper structure)
     eval_env = DummyVecEnv([lambda: create_phase3_env(env_data, second_data, market_name, config, rank=999, hybrid_agent=None)])
+    eval_env = ActionMaskVecEnvWrapper(eval_env)
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-    eval_env = ensure_vecenv_action_masks(eval_env)
 
     # CRITICAL FIX: Load or create model with hybrid policy (enables LLM during training)
     if continue_training and model_path:
@@ -1212,8 +1243,8 @@ def train_phase3(
 
     # Recreate evaluation environment with hybrid agent
     eval_env = DummyVecEnv([lambda: create_phase3_env(env_data, second_data, market_name, config, rank=999, hybrid_agent=hybrid_agent)])
+    eval_env = ActionMaskVecEnvWrapper(eval_env)
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-    eval_env = ensure_vecenv_action_masks(eval_env)
 
     safe_print("[ENV] Hybrid agent communication channels established")
 
@@ -1293,8 +1324,13 @@ def train_phase3(
 
         # Also save final model (legacy support)
         checkpoint_path = f"{config['model_save_path']}/phase3_hybrid_interrupted"
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
         model.save(checkpoint_path)
-        train_env.save(config['vecnormalize_path'])
+        vecnorm_path = config['vecnormalize_path']
+        vecnorm_dir = os.path.dirname(vecnorm_path)
+        if vecnorm_dir:
+            os.makedirs(vecnorm_dir, exist_ok=True)
+        train_env.save(vecnorm_path)
 
         safe_print(f"[SAVE] Legacy checkpoint saved to: {checkpoint_path}")
         return model

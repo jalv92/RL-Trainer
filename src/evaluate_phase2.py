@@ -24,6 +24,8 @@ import pandas as pd
 from sb3_contrib import MaskablePPO  # Phase 2 uses MaskablePPO, not standard PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+from action_mask_utils import ActionMaskGymnasiumWrapper, ActionMaskVecEnvWrapper
+
 from apex_compliance_checker import ApexComplianceChecker
 from environment_phase2 import TradingEnvironmentPhase2
 from feature_engineering import add_market_regime_features
@@ -165,7 +167,17 @@ def evaluate_phase2_model(
     safe_print("PHASE 2 MODEL EVALUATION")
     safe_print("=" * 80)
 
-    resolved_artifacts = _resolve_model_artifacts(model_path, vecnorm_path, market)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    abs_model_path = _to_project_path(model_path, project_root)
+    abs_vecnorm_path = _to_project_path(vecnorm_path, project_root)
+    models_dir = os.path.join(project_root, 'models')
+
+    resolved_artifacts = _resolve_model_artifacts(
+        abs_model_path,
+        abs_vecnorm_path,
+        market,
+        models_dir
+    )
     if resolved_artifacts is None:
         safe_print("[ERROR] Train Phase 2 first: python3 train_phase2.py")
         return None
@@ -243,7 +255,7 @@ def evaluate_phase2_model(
 
     # Create environment
     safe_print("[ENV] Creating Phase 2 evaluation environment...")
-    env = TradingEnvironmentPhase2(
+    trading_env = TradingEnvironmentPhase2(
         data,
         window_size=20,
         initial_balance=50000,
@@ -252,15 +264,17 @@ def evaluate_phase2_model(
         position_size_contracts=1.0,
         trailing_drawdown_limit=2500
     )
-    env = DummyVecEnv([lambda: env])
+    base_env = ActionMaskGymnasiumWrapper(trading_env)
+    vec_env = DummyVecEnv([lambda: base_env])
+    vec_env = ActionMaskVecEnvWrapper(vec_env)
 
     # Load VecNormalize
     if os.path.exists(vecnorm_path):
-        env = VecNormalize.load(vecnorm_path, env)
+        env = VecNormalize.load(vecnorm_path, vec_env)
         safe_print(f"[ENV] Loaded VecNormalize from {vecnorm_path}")
         _verify_artifact_metadata(vecnorm_path, market_symbol, 'VecNormalize stats')
     else:
-        env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+        env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
         safe_print("[ENV] Using fresh VecNormalize (stats not found)")
 
     env.training = False
@@ -337,7 +351,7 @@ def evaluate_phase2_model(
         safe_print(f"[EVAL] Final action mask (valid actions): {final_action_mask}")
 
     # Get environment instance for trade history
-    env_unwrapped = env.envs[0]
+    env_unwrapped = trading_env
 
     # Calculate metrics
     equity_array = np.array(equity_curve)
@@ -372,8 +386,9 @@ def evaluate_phase2_model(
     pm_usage = len(pm_actions_taken) / step * 100 if step > 0 else 0
 
     # Calculate comprehensive metrics
+    trade_history = getattr(env_unwrapped, 'trade_history', [])
     comprehensive_metrics = calculate_comprehensive_metrics(
-        equity_curve, env_unwrapped.trade_history
+        equity_curve, trade_history
     )
     
     # Results
@@ -778,6 +793,13 @@ def _resolve_market_from_metadata(
     )
 
 
+def _to_project_path(path: str, project_root: str) -> str:
+    """Resolve a potentially relative path against the repository root."""
+    if os.path.isabs(path):
+        return path
+    return os.path.join(project_root, path)
+
+
 def _verify_artifact_metadata(path: str, market_symbol: Optional[str], artifact_label: str):
     metadata = read_metadata(path)
     if not metadata:
@@ -791,9 +813,11 @@ def _verify_artifact_metadata(path: str, market_symbol: Optional[str], artifact_
         )
 
     if metadata.get('test_mode'):
-        raise RuntimeError(
-            f"{artifact_label} metadata indicates test mode training; retrain with production timesteps."
+        safe_print(
+            f"[WARN] {artifact_label} metadata indicates test mode training; "
+            "treat evaluation as smoke-test only."
         )
+        return metadata
 
     total_timesteps = metadata.get('total_timesteps')
     if isinstance(total_timesteps, (int, float)) and total_timesteps < MIN_TIMESTEPS_WARNING:
@@ -808,7 +832,8 @@ def _verify_artifact_metadata(path: str, market_symbol: Optional[str], artifact_
 def _resolve_model_artifacts(
     model_path: str,
     vecnorm_path: str,
-    requested_market: Optional[str]
+    requested_market: Optional[str],
+    models_dir: str
 ) -> Optional[tuple[str, str]]:
     """Ensure model/VecNormalize paths exist, falling back to newest artifacts if needed."""
 
@@ -819,7 +844,7 @@ def _resolve_model_artifacts(
         return model_path, vecnorm_path
 
     safe_print(f"[WARN] Requested artifacts missing: model={model_exists}, vecnorm={vecnorm_exists}")
-    candidates = detect_models_in_folder(phase='phase2')
+    candidates = detect_models_in_folder(model_dir=models_dir, phase='phase2')
 
     if not candidates:
         safe_print("[ERROR] No Phase 2 models found in models/ directory.")

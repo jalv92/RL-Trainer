@@ -70,7 +70,7 @@ from checkpoint_retention import CheckpointRetentionManager
 
 # SELF-CORRECTING SYSTEM
 from self_correcting_init import init_self_correcting_system
-from action_mask_utils import ensure_vecenv_action_masks
+from action_mask_utils import ActionMaskVecEnvWrapper, ActionMaskGymnasiumWrapper
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':
@@ -380,6 +380,7 @@ def make_env(data, second_data, env_id, config, market_spec):
         assert hasattr(env, '_determine_episode_start'), \
             "Environment missing _determine_episode_start method"
 
+        env = ActionMaskGymnasiumWrapper(env)
         return Monitor(env)
 
     return _init
@@ -478,6 +479,9 @@ def train_phase1(
         safe_print(f"[ENV] Using SubprocVecEnv ({num_envs} processes)")
         env = SubprocVecEnv(env_fns)
 
+    # Ensure action masks are exposed before VecNormalize (pickle-safe)
+    env = ActionMaskVecEnvWrapper(env)
+
     # Add normalization
     env = VecNormalize(
         env,
@@ -486,32 +490,33 @@ def train_phase1(
         clip_obs=10.0,
         clip_reward=10.0
     )
-    env = ensure_vecenv_action_masks(env)
 
     safe_print("[ENV] Training environments created with VecNormalize")
 
     # Create evaluation environment
     safe_print("[EVAL] Creating VALIDATION environment (unseen data)...")
-    eval_env = DummyVecEnv([lambda: Monitor(TradingEnvironmentPhase1(
-        data=val_data,
-        window_size=PHASE1_CONFIG['window_size'],
-        initial_balance=PHASE1_CONFIG['initial_balance'],
-        second_data=val_second_data,
-        market_spec=market_spec,
-        commission_override=PHASE1_CONFIG.get('commission_override', None),
-        initial_sl_multiplier=PHASE1_CONFIG['initial_sl_multiplier'],
-        initial_tp_ratio=PHASE1_CONFIG['initial_tp_ratio'],
-        position_size_contracts=PHASE1_CONFIG['position_size'],
-        trailing_drawdown_limit=PHASE1_CONFIG['trailing_dd_limit'],
-        start_index=PHASE1_CONFIG['window_size'],
-        randomize_start_offsets=False,
-        min_episode_bars=PHASE1_CONFIG.get('min_episode_bars', 1500),
-        enable_daily_loss_limit=False,
-        enable_profit_target=False,
-        enable_4pm_rule=True,
-    ))])
+    eval_env = DummyVecEnv([
+        lambda: Monitor(ActionMaskGymnasiumWrapper(TradingEnvironmentPhase1(
+            data=val_data,
+            window_size=PHASE1_CONFIG['window_size'],
+            initial_balance=PHASE1_CONFIG['initial_balance'],
+            second_data=val_second_data,
+            market_spec=market_spec,
+            commission_override=PHASE1_CONFIG.get('commission_override', None),
+            initial_sl_multiplier=PHASE1_CONFIG['initial_sl_multiplier'],
+            initial_tp_ratio=PHASE1_CONFIG['initial_tp_ratio'],
+            position_size_contracts=PHASE1_CONFIG['position_size'],
+            trailing_drawdown_limit=PHASE1_CONFIG['trailing_dd_limit'],
+            start_index=PHASE1_CONFIG['window_size'],
+            randomize_start_offsets=False,
+            min_episode_bars=PHASE1_CONFIG.get('min_episode_bars', 1500),
+            enable_daily_loss_limit=False,
+            enable_profit_target=False,
+            enable_4pm_rule=True,
+        )))
+    ])
+    eval_env = ActionMaskVecEnvWrapper(eval_env)
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-    eval_env = ensure_vecenv_action_masks(eval_env)
 
     # Create learning rate schedule
     learning_rate = PHASE1_CONFIG['learning_rate']

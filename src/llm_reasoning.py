@@ -17,6 +17,7 @@ import os
 import logging
 import time
 import json
+import re
 import yaml
 from pathlib import Path
 from typing import Tuple, Dict, Optional
@@ -581,7 +582,15 @@ class LLMReasoningModule:
 
             # Add system prompt
             system_prompt = self.config['prompts']['system']
-            full_prompt = f"{system_prompt}\n\n{prompt}"
+            strict_instruction = (
+                "\nOUTPUT (one line only): ACTION | confidence | reason\n"
+                "Allowed ACTION values: HOLD, BUY, SELL, MOVE_TO_BE, ENABLE_TRAIL, DISABLE_TRAIL.\n"
+                "Confidence must be a decimal between 0 and 1 (e.g., 0.72).\n"
+                "Example: HOLD | 0.20 | Risk protection after 3 losses\n"
+                "BEGIN YOUR ANSWER IMMEDIATELY AFTER THIS INSTRUCTION WITH THE ACTION WORD.\n"
+                "Do NOT include markdown, headings, or extra text."
+            )
+            full_prompt = f"{system_prompt}\n\n{prompt}{strict_instruction}"
 
             return full_prompt
 
@@ -603,7 +612,15 @@ class LLMReasoningModule:
                 "[LLM] Model not loaded. Cannot generate response. "
                 "Ensure model initialization succeeded."
             )
-        return self._generate_raw(prompt, max_new_tokens=max_new_tokens)
+        raw_response = self._generate_raw(prompt, max_new_tokens=max_new_tokens)
+        if '|' not in (raw_response or ''):
+            preview = (raw_response or "").strip().splitlines()
+            preview = preview[0] if preview else ""
+            self.logger.warning(
+                f"[LLM] Non-compliant response detected, applying fallback: '{preview}'"
+            )
+            return "HOLD | 0.0 | FORMAT_FALLBACK"
+        return raw_response
 
     def _generate_raw(self, prompt: str, max_new_tokens: Optional[int] = None) -> str:
         """Generate LLM response from the model."""
@@ -652,57 +669,87 @@ class LLMReasoningModule:
             Tuple of (action, confidence, reasoning)
         """
         try:
-            # Clean response
-            response = response.strip()
-            
-            # Split by pipe
-            parts = response.split('|')
-            
-            if len(parts) >= 3:
-                # Parse action
-                action_str = parts[0].strip().upper()
-                
-                # Parse confidence
-                try:
-                    confidence = float(parts[1].strip())
-                except ValueError:
-                    self.logger.warning(f"[LLM] Invalid confidence format: {parts[1]}")
-                    confidence = 0.5
-                
-                # Parse reasoning
-                reasoning = parts[2].strip()
-                
-                # Map action string to integer
-                action_map = {
-                    'HOLD': 0,
-                    'BUY': 1,
-                    'SELL': 2,
-                    'MOVE_TO_BE': 3,
-                    'MOVE_SL_TO_BE': 3,
-                    'ENABLE_TRAIL': 4,
-                    'DISABLE_TRAIL': 5
-                }
-                
-                action = action_map.get(action_str, 0)  # Default to HOLD
-                
-                # Clamp confidence to valid range
-                confidence = max(0.0, min(1.0, confidence))
-                
-                return action, confidence, reasoning
-            
-            else:
-                # Try alternative parsing (comma separated)
-                if ',' in response:
-                    parts = response.split(',')
-                    if len(parts) >= 3:
-                        return self._parse_response(' | '.join(parts))
-                
-                raise ValueError(f"Invalid format: {response}")
-        
+            response = (response or "").strip()
+            if not response:
+                raise ValueError("Empty response")
+
+            parsed = self._parse_pipe_format(response)
+            if parsed:
+                return parsed
+
+            parsed = self._parse_json_like_response(response)
+            if parsed:
+                return parsed
+
+            parsed = self._parse_regex_response(response)
+            if parsed:
+                return parsed
+
+            raise ValueError(f"Invalid format: {response}")
+
         except Exception as e:
             self.logger.warning(f"[LLM] Parse error: {e}, response: '{response}'")
-            # Fallback to HOLD
             return 0, 0.0, f"PARSE_ERROR: {response}"
+
+    def _parse_pipe_format(self, response: str) -> Optional[Tuple[int, float, str]]:
+        parts = [p.strip() for p in response.split('|')]
+        if len(parts) < 3:
+            return None
+        return self._coerce_parsed_values(parts[0], parts[1], parts[2])
+
+    def _parse_json_like_response(self, response: str) -> Optional[Tuple[int, float, str]]:
+        try:
+            json_start = response.find('{')
+            json_end = response.rfind('}')
+            if json_start != -1 and json_end != -1 and json_end > json_start:
+                snippet = response[json_start:json_end + 1]
+                data = json.loads(snippet)
+                action = data.get('action')
+                confidence = data.get('confidence', data.get('confidence_score'))
+                reasoning = data.get('reasoning') or data.get('explanation') or ''
+                if action is None or confidence is None:
+                    return None
+                return self._coerce_parsed_values(str(action), str(confidence), reasoning)
+        except Exception:
+            return None
+        return None
+
+    def _parse_regex_response(self, response: str) -> Optional[Tuple[int, float, str]]:
+        action_match = re.search(
+            r"\b(HOLD|BUY|SELL|MOVE_TO_BE|MOVE_SL_TO_BE|ENABLE_TRAIL|DISABLE_TRAIL)\b",
+            response,
+            re.IGNORECASE,
+        )
+        conf_match = re.search(r"(\d+(?:\.\d+)?|\.\d+)", response)
+        if not action_match or not conf_match:
+            return None
+        action_str = action_match.group(1).upper()
+        confidence = conf_match.group(1)
+        reasoning_start = action_match.end()
+        reasoning = response[reasoning_start:].strip()
+        return self._coerce_parsed_values(action_str, confidence, reasoning)
+
+    def _coerce_parsed_values(
+        self, action_str: str, confidence_value: str, reasoning: str
+    ) -> Tuple[int, float, str]:
+        action_map = {
+            'HOLD': 0,
+            'BUY': 1,
+            'SELL': 2,
+            'MOVE_TO_BE': 3,
+            'MOVE_SL_TO_BE': 3,
+            'ENABLE_TRAIL': 4,
+            'DISABLE_TRAIL': 5,
+        }
+        action = action_map.get(action_str.strip().upper(), 0)
+        try:
+            confidence = float(confidence_value)
+        except ValueError:
+            self.logger.warning(f"[LLM] Invalid confidence format: {confidence_value}")
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        clean_reasoning = (reasoning or "").strip() or "LLM provided no reasoning"
+        return action, confidence, clean_reasoning
     
     def _format_last_trades(self, position_state: Dict) -> str:
         """Format last 3 trades for prompt."""

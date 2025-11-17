@@ -794,3 +794,11 @@ class TradingEnvironmentPhase1(gym.Env):
         else:
             # In position: Only HOLD valid
             return np.array([True, False, False], dtype=np.bool_)
+
+    def get_action_mask(self) -> np.ndarray:
+        """
+        Gymnasium-friendly accessor for the current action mask.
+        Returns a copy so downstream wrappers can't mutate internal state.
+        """
+        mask = self.action_masks()
+        return mask.copy() if isinstance(mask, np.ndarray) else np.array(mask, dtype=bool)

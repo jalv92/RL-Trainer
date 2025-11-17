@@ -7,10 +7,10 @@ llm_model:
   local_path: "Phi-3-mini-4k-instruct"  # Fixed path to manually downloaded model
   quantization: "int8"  # Options: int8, int4, none
   device: "auto"  # Options: auto, cuda, cpu
-  max_new_tokens: 50  # Max tokens for LLM response
-  temperature: 0.1  # Low temperature for consistent trading advice
+  max_new_tokens: 96  # Max tokens for LLM response (prevents truncation / long rambles)
+  temperature: 0.3  # Slightly higher to encourage decisive outputs
   top_p: 0.9  # Nucleus sampling parameter
-  do_sample: true  # Enable sampling for varied responses
+  do_sample: false  # Deterministic decoding for strict formatting
 
 # Decision Fusion Parameters
 fusion:
