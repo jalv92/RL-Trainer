@@ -98,7 +98,19 @@ results/*
 # LLM artifacts/cache
 artifacts/
 !artifacts/.gitkeep
+
+# Downloaded/External Training Frameworks
+SofT-GRPO-master/
+SofT-GRPO-master-main/
+
+# Downloaded Model Folders
+Phi-3-mini-4k-instruct/
+Phi-3-mini-128k-instruct/
 @Phi-3-mini-4k-instruct/
+
+# Base Model folder (keep folder structure, ignore contents)
+Base_Model/*
+!Base_Model/.gitkeep
 
 # Exception: Allow documentation images
 !img/*.png
