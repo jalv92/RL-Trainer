@@ -5,6 +5,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+# Paquetes Node.js
+node_modules/
 .Python
 build/
 develop-eggs/

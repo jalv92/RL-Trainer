@@ -1,4 +1,4 @@
-"""
+﻿"""
 Dynamic Checkpoint Management System
 Intelligent, event-driven checkpoint saves for RL training
 
@@ -111,6 +111,7 @@ class DynamicCheckpointManager(BaseCallback):
         self._last_save_timestep = 0
         self._save_counter = 0
         self._disable_saves = False  # Disk-full protection
+        self._awaiting_first_eval_notice = False
 
         # Runtime tracking
         self._training_start_time = None
@@ -250,7 +251,7 @@ class DynamicCheckpointManager(BaseCallback):
             self._save_counter += 1
 
             if self.verbose_mode:
-                self._print(f"[CHECKPOINT] ✓ Saved: {model_path.name}")
+                self._print(f"[CHECKPOINT] Γ£ô Saved: {model_path.name}")
                 self._print(f"[CHECKPOINT]   Val Reward: {metrics.get('val_reward', 0.0):+.3f} | Sharpe: {metrics.get('sharpe_ratio', 0.0):+.2f}")
 
             return True
@@ -335,13 +336,18 @@ class DynamicCheckpointManager(BaseCallback):
 
         # Check for metric improvement (event-driven)
         if self.event_config['enabled'] and self.metric_tracker is not None:
-            current_metrics = self._get_current_metrics()
-            current_val_reward = current_metrics.get('val_reward', float('-inf'))
+            evals_run = getattr(self.metric_tracker, 'eval_count', 0)
+            if evals_run > 0:
+                current_metrics = self._get_current_metrics()
+                current_val_reward = current_metrics.get('val_reward', float('-inf'))
 
-            # Trigger save on significant improvement
-            if current_val_reward > self._best_metric * (1 + self.metric_threshold):
-                if self._save_checkpoint('best', current_metrics):
-                    self._best_metric = current_val_reward
+                # Trigger save on significant improvement
+                if current_val_reward > self._best_metric * (1 + self.metric_threshold):
+                    if self._save_checkpoint('best', current_metrics):
+                        self._best_metric = current_val_reward
+            elif self.verbose_mode and not self._awaiting_first_eval_notice:
+                self._print("[CHECKPOINT] Waiting for first evaluation before tracking best-model saves")
+                self._awaiting_first_eval_notice = True
 
         return True
 
@@ -437,6 +443,7 @@ class MetricTrackingEvalCallback:
         self.forecaster = forecaster
         self.last_forecast = None  # Store last forecast result
         self.timesteps = 0  # Track timesteps for forecaster
+        self.last_episode_count = 0
 
     def update(self, locals_dict: Dict[str, Any], globals_dict: Dict[str, Any]) -> None:
         """
@@ -448,122 +455,137 @@ class MetricTrackingEvalCallback:
             locals_dict: Local variables from EvalCallback
             globals_dict: Global variables from EvalCallback
         """
-        # Extract episode rewards from evaluation
-        if 'episode_rewards' in locals_dict:
-            rewards = locals_dict['episode_rewards']
+        rewards = self._extract_episode_rewards(locals_dict)
+        if rewards is None:
+            print('[WARNING] Eval metrics unavailable - episode_rewards missing')
+            return
 
-            if len(rewards) > 0:
-                # Calculate metrics
-                mean_reward = float(np.mean(rewards))
-                std_reward = float(np.std(rewards))
+        if rewards.size == 0:
+            print('[WARNING] Eval metrics unavailable - empty reward array')
+            return
 
-                # Sharpe ratio (assuming risk-free rate ≈ 0)
-                sharpe = mean_reward / std_reward if std_reward > 0 else 0.0
+        episode_count = rewards.size
+        self.last_episode_count = episode_count
+        if episode_count < 2:
+            print("[EVAL] Warning: evaluation ran fewer than 2 episodes; variance may be zero")
 
-                # Win rate (% positive episodes)
-                win_rate = float(np.mean(np.array(rewards) > 0))
+        mean_reward = float(np.mean(rewards))
+        std_reward = float(np.std(rewards))
+        sharpe = mean_reward / std_reward if std_reward > 1e-8 else 0.0
+        win_rate = float(np.mean(rewards > 0))
 
-                # Drawdown (simplified - max cumulative loss)
-                cumulative = np.cumsum(rewards)
-                running_max = np.maximum.accumulate(cumulative)
-                drawdown = cumulative - running_max
-                max_drawdown = float(np.min(drawdown)) if len(drawdown) > 0 else 0.0
+        cumulative = np.cumsum(rewards)
+        running_max = np.maximum.accumulate(cumulative)
+        drawdown = cumulative - running_max
+        max_drawdown = float(np.min(drawdown)) if len(drawdown) > 0 else 0.0
+        total_return = float(np.sum(rewards))
 
-                # Total return
-                total_return = float(np.sum(rewards))
+        self.last_metrics = {
+            'val_reward': mean_reward,
+            'sharpe_ratio': sharpe,
+            'win_rate': win_rate,
+            'max_drawdown': max_drawdown,
+            'total_return': total_return,
+            'std_reward': std_reward
+        }
 
-                # Update last metrics
-                self.last_metrics = {
-                    'val_reward': mean_reward,
-                    'sharpe_ratio': sharpe,
-                    'win_rate': win_rate,
-                    'max_drawdown': max_drawdown,
-                    'total_return': total_return,
-                    'std_reward': std_reward
-                }
+        if mean_reward > self.best_metric:
+            self.best_metric = mean_reward
 
-                # Update best metric
-                if mean_reward > self.best_metric:
-                    self.best_metric = mean_reward
+        self.eval_count += 1
 
-                self.eval_count += 1
+        if self.forecaster is not None:
+            if 'model' in locals_dict and hasattr(locals_dict['model'], 'num_timesteps'):
+                self.timesteps = locals_dict['model'].num_timesteps
+            else:
+                self.timesteps += 1
 
-                # Update forecaster if available
-                if self.forecaster is not None:
-                    # Update timesteps (try to get from locals_dict or use internal counter)
-                    if 'model' in locals_dict and hasattr(locals_dict['model'], 'num_timesteps'):
-                        self.timesteps = locals_dict['model'].num_timesteps
-                    else:
-                        self.timesteps += 1  # Fallback to evaluation counter
+            try:
+                self.last_forecast = self.forecaster.update(sharpe, self.timesteps)
+            except Exception as e:
+                print(f"[WARNING] Forecaster update failed: {e}")
 
-                    # Update forecaster with primary metric (Sharpe ratio)
-                    try:
-                        self.last_forecast = self.forecaster.update(sharpe, self.timesteps)
-                    except Exception as e:
-                        print(f"[WARNING] Forecaster update failed: {e}")
+        print(f"[EVAL] Metrics updated: reward={mean_reward:.2f}, sharpe={sharpe:.2f}, win_rate={win_rate:.2%}, episodes={episode_count}")
+
+    @staticmethod
+    def _extract_episode_rewards(locals_dict: Dict[str, Any]) -> Optional[np.ndarray]:
+        """
+        Extract evaluation rewards from EvalCallback locals.
+
+        Accepts multiple key names and coerces to a 1D float64 array.
+        """
+        potential_keys = ('episode_rewards', 'rewards', 'eval_episode_rewards')
+        rewards: Optional[np.ndarray] = None
+
+        for key in potential_keys:
+            if key in locals_dict:
+                rewards = np.asarray(locals_dict[key], dtype=np.float64).reshape(-1)
+                break
+
+        if rewards is None:
+            return None
+
+        return rewards
 
     def set_seed(self, seed: int) -> None:
         """Set random seed for metadata."""
         self.seed = seed
-
-
 class EvalMetricHook(BaseCallback):
     """
-    Callback hook that updates MetricTrackingEvalCallback after each evaluation.
-
-    Designed to work with EvalCallback's callback_after_eval parameter.
-    Extracts the latest evaluation results and feeds them to the metric tracker.
-
-    Usage:
-        metric_tracker = MetricTrackingEvalCallback()
-        metric_hook = EvalMetricHook(metric_tracker)
-
-        eval_callback = EvalCallback(
-            ...,
-            callback_after_eval=metric_hook  # Or CallbackList([early_stop, metric_hook])
-        )
+    Callback hook that updates MetricTrackingEvalCallback after each evaluation
+    and optionally chains additional callbacks that must run under EvalCallback.
     """
 
-    def __init__(self, metric_tracker: MetricTrackingEvalCallback, verbose: int = 0):
-        """
-        Initialize hook.
-
-        Args:
-            metric_tracker: MetricTrackingEvalCallback instance to update
-            verbose: Verbosity level
-        """
+    def __init__(
+        self,
+        metric_tracker: MetricTrackingEvalCallback,
+        extra_callbacks: Optional[List[BaseCallback]] = None,
+        verbose: int = 0,
+    ):
         super().__init__(verbose)
         self.metric_tracker = metric_tracker
+        self.extra_callbacks: list[BaseCallback] = [cb for cb in (extra_callbacks or []) if cb is not None]
+
+    def _init_callback(self) -> None:
+        for callback in self.extra_callbacks:
+            callback.parent = self.parent
+            callback.init_callback(self.model)
+
+    def _on_training_start(self) -> None:
+        for callback in self.extra_callbacks:
+            callback.on_training_start(self.locals, self.globals)
+
+    def _on_rollout_start(self) -> None:
+        for callback in self.extra_callbacks:
+            callback.on_rollout_start()
+
+    def _on_rollout_end(self) -> None:
+        for callback in self.extra_callbacks:
+            callback.on_rollout_end()
+
+    def _on_training_end(self) -> None:
+        for callback in self.extra_callbacks:
+            callback.on_training_end()
 
     def _on_step(self) -> bool:
-        """
-        Called after each evaluation by EvalCallback.
+        continue_training = True
 
-        Extracts the latest episode rewards from parent's evaluations_results and updates tracker.
+        for callback in self.extra_callbacks:
+            callback.parent = self.parent
+            continue_training = callback.on_step() and continue_training
 
-        Returns:
-            True to continue training (required by SB3)
-        """
-        # Access parent callback's evaluation results (EvalCallback stores them in evaluations_results)
         if self.parent is not None and hasattr(self.parent, 'evaluations_results'):
-            # Get the last evaluation's rewards
-            # evaluations_results is a list where each element is an array of episode rewards
             if len(self.parent.evaluations_results) > 0:
-                latest_rewards = self.parent.evaluations_results[-1]
-
-                # Create locals dict matching what evaluate_policy returns
                 tracker_locals = {
-                    'episode_rewards': latest_rewards,
-                    'model': self.model  # Pass model for timestep tracking
+                    'episode_rewards': self.parent.evaluations_results[-1],
+                    'model': self.model,
                 }
-                tracker_globals = {}
+                self.metric_tracker.update(tracker_locals, {})
 
-                # Update the metric tracker
-                self.metric_tracker.update(tracker_locals, tracker_globals)
+        return continue_training
 
-        # Always return True to continue training
-        return True
-
-
+    def update_child_locals(self, locals_: dict[str, Any]) -> None:
+        for callback in self.extra_callbacks:
+            callback.update_locals(locals_)
 # Backward compatibility alias
 SafeCheckpointCallback = DynamicCheckpointManager

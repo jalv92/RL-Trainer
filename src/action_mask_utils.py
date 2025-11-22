@@ -200,6 +200,49 @@ class ActionMaskGymnasiumWrapper(gym.Wrapper):
 
         return np.ones(self.action_space.n, dtype=bool)
 
+
+def phase2_mask_fn(env) -> np.ndarray:
+    """
+    Resolve the underlying TradingEnvironmentPhase2 instance (if present)
+    and return its six-action mask. Designed to be pickle-safe by living in
+    a dedicated module that SubprocVecEnv workers can import.
+    """
+    try:
+        from environment_phase2 import TradingEnvironmentPhase2
+    except ImportError:  # pragma: no cover - defensive
+        TradingEnvironmentPhase2 = None  # type: ignore[assignment]
+
+    current = env
+    visited: set[int] = set()
+
+    # Search for the concrete Phase 2 environment first
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if TradingEnvironmentPhase2 is not None and isinstance(current, TradingEnvironmentPhase2):
+            masks = current.action_masks()
+            if masks is not None:
+                result = np.asarray(masks, dtype=bool)
+                if result.shape == (6,):
+                    return result
+        current = getattr(current, "env", None)
+
+    # Fallback: try generic action_masks hooks on wrapper chain
+    current = env
+    visited.clear()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        action_masks_fn = getattr(current, "action_masks", None)
+        if callable(action_masks_fn):
+            masks = action_masks_fn()
+            if masks is not None:
+                result = np.asarray(masks, dtype=bool)
+                if result.shape == (6,):
+                    return result
+        current = getattr(current, "env", None)
+
+    # Last resort: allow all actions
+    return np.ones(6, dtype=bool)
+
     def get_wrapper_attr(self, name: str) -> Any:
         if name == "action_mask":
             return self.get_action_mask()

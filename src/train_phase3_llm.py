@@ -20,6 +20,7 @@ Based on: train_phase2.py with LLM integration
 import os
 import platform
 import shutil
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
@@ -96,8 +97,10 @@ from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
+from functools import partial
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
+from stable_baselines3.common.evaluation import evaluate_policy
 
 # Phase 3 imports
 from environment_phase3_llm import TradingEnvironmentPhase3LLM
@@ -115,11 +118,11 @@ from action_mask_utils import (
     get_action_masks,
 )
 from self_correcting_init import init_self_correcting_system
+from training_mode_utils import tune_eval_schedule
 
 # CHECKPOINT MANAGEMENT (replaces old SafeCheckpointCallback)
 from checkpoint_manager import DynamicCheckpointManager, MetricTrackingEvalCallback, EvalMetricHook
 from checkpoint_retention import CheckpointRetentionManager
-from stable_baselines3.common.callbacks import CallbackList
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':
@@ -274,7 +277,12 @@ PHASE3_CONFIG = {
     'deterministic_env_offsets': False,  # If True, spread envs evenly instead of random
     'start_offset_seed': 42,  # Base seed for deterministic offsets
     # Callbacks
-    'eval_freq': 10000,
+    'eval_freq': 5000,
+    'n_eval_episodes': 10,
+    'sanity_eval_episodes': 3,
+    'evals_per_update': 8,
+    'eval_interval_updates': 5,
+    'min_eval_episodes': 6,
     'save_freq': 50000,
     'llm_log_freq': 1000,  # LLM-specific logging frequency
     # Model paths
@@ -405,7 +413,7 @@ def create_phase3_env(env_data, second_data=None, market_name=None, config=None,
 
     # Ensure ActionMasker is the outermost layer so MaskablePPO (and Gym)
     # can access action_masks without deprecated attribute hops.
-    return ActionMasker(env, lambda env: get_action_masks(env))
+    return ActionMasker(env, get_action_masks)
 
 
 def _unwrap_gym_env(env):
@@ -464,6 +472,46 @@ def register_training_envs(vec_env, expected_envs, hybrid_agent=None) -> bool:
     if registered < expected_envs:
         safe_print(f"[ENV] [WARN] Expected {expected_envs} envs but only registered {registered}.")
     return registered > 0
+
+
+def build_eval_env(
+    env_data,
+    second_data,
+    market_name,
+    config,
+    train_env,
+    hybrid_agent=None,
+    rank: int = 999,
+):
+    """
+    Create an evaluation environment that mirrors the training wrappers and
+    shares VecNormalize statistics.
+    """
+    env_thunk = partial(
+        create_phase3_env,
+        env_data,
+        second_data,
+        market_name,
+        config,
+        rank,
+        hybrid_agent=hybrid_agent,
+    )
+    eval_env = DummyVecEnv([env_thunk])
+    eval_env = ActionMaskVecEnvWrapper(eval_env)
+    eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    eval_env.training = False
+    eval_env.norm_reward = False
+
+    if isinstance(train_env, VecNormalize):
+        try:
+            eval_env.obs_rms = deepcopy(train_env.obs_rms)
+            eval_env.ret_rms = deepcopy(train_env.ret_rms)
+            eval_env.clip_obs = getattr(train_env, "clip_obs", eval_env.clip_obs)
+            eval_env.clip_reward = getattr(train_env, "clip_reward", eval_env.clip_reward)
+        except AttributeError:
+            pass
+
+    return eval_env
 
 
 def load_data_for_training(market_name, data_path_pattern, use_second_data=False):
@@ -762,7 +810,7 @@ def create_callbacks(model, eval_env, hybrid_agent, market_name, config=None):
         config: Configuration dictionary
     
     Returns:
-        List of callbacks
+        Tuple[List[BaseCallback], DynamicCheckpointManager, MetricTrackingEvalCallback]
     """
     if config is None:
         config = PHASE3_CONFIG
@@ -781,11 +829,26 @@ def create_callbacks(model, eval_env, hybrid_agent, market_name, config=None):
 
     # Evaluation callback with metric hook
     # Note: Phase 3 doesn't use early stopping, so only metric_hook is needed
+    steps_per_update = config.get('n_steps', 2048) * max(1, config.get('n_envs', 1))
+    recommended_eval_freq = max(steps_per_update // max(1, config.get('evals_per_update', 8)), 1000)
+    eval_freq = int(config.get('eval_freq', recommended_eval_freq))
+    if eval_freq > recommended_eval_freq:
+        safe_print(f"[EVAL] eval_freq={eval_freq:,} too coarse for {steps_per_update:,} steps/update. "
+                   f"Lowering to {recommended_eval_freq:,}.")
+        eval_freq = recommended_eval_freq
+
+    n_eval_episodes = max(1, int(config.get('n_eval_episodes', 10)))
+    best_model_dir = Path(config['model_save_path']) / market_name
+    best_model_dir.mkdir(parents=True, exist_ok=True)
+    eval_log_dir = Path("./logs/phase3_eval") / market_name
+    eval_log_dir.mkdir(parents=True, exist_ok=True)
+
     eval_callback = SafeEvalCallback(
         eval_env,
-        best_model_save_path=config['model_save_path'],
-        log_path="./logs/phase3_eval",
-        eval_freq=config['eval_freq'],
+        best_model_save_path=str(best_model_dir),
+        log_path=str(eval_log_dir),
+        eval_freq=eval_freq,
+        n_eval_episodes=n_eval_episodes,
         deterministic=True,
         render=False,
         verbose=1,
@@ -801,7 +864,7 @@ def create_callbacks(model, eval_env, hybrid_agent, market_name, config=None):
         config_path='config/checkpoint_config.yaml',
         metric_tracker=metric_tracker,
         target_timesteps=config['total_timesteps'],
-        verbose=True,
+        verbose=False,
         registry=registry
     )
     safe_print(f"[CHECKPOINT] Dynamic checkpoint manager initialized")
@@ -1029,7 +1092,7 @@ def create_callbacks(model, eval_env, hybrid_agent, market_name, config=None):
         else:
             safe_print("[CALLBACK] Adapter warmup skipped (no adapter in policy)")
 
-    return callbacks, checkpoint_manager
+    return callbacks, checkpoint_manager, metric_tracker
 
 
 def train_phase3(
@@ -1077,6 +1140,15 @@ def train_phase3(
     if config.get('vec_env_cls') == 'subproc' and not supports_subproc_vec_env():
         safe_print("[ENV] SubprocVecEnv unsupported on this host, falling back to DummyVecEnv")
         config['vec_env_cls'] = 'dummy'
+
+    tune_eval_schedule(
+        config,
+        test_mode=test_mode,
+        label="Phase 3",
+        eval_updates=config.get('eval_interval_updates', 5),
+        min_eval_episodes=config.get('min_eval_episodes', 6),
+        printer=safe_print,
+    )
 
     safe_print(
         f"[THREADS] BLAS threads={_THREAD_LIMIT_INT} | PyTorch threads={TORCH_THREADS_EFFECTIVE} "
@@ -1141,19 +1213,33 @@ def train_phase3(
     # Subprocesses only execute environment steps; LLM decisions happen in main process policy
     if config['vec_env_cls'] == 'subproc':
         # SubprocVecEnv: Pass None for hybrid_agent (avoids pickling ThreadPoolExecutor)
-        def make_env(rank):
-            return lambda: create_phase3_env(
-                env_data, second_data, market_name, config, rank, hybrid_agent=None
+        base_vec_env = SubprocVecEnv([
+            partial(
+                create_phase3_env,
+                env_data,
+                second_data,
+                market_name,
+                config,
+                i,
+                None,
             )
-        base_vec_env = SubprocVecEnv([make_env(i) for i in range(config['n_envs'])])
+            for i in range(config['n_envs'])
+        ])
         safe_print("[ENV] Using SubprocVecEnv (multiprocess) - hybrid_agent in main process only")
     else:
         # DummyVecEnv: Can pass hybrid_agent (single process, no pickling needed)
-        def make_env(rank):
-            return lambda: create_phase3_env(
-                env_data, second_data, market_name, config, rank, hybrid_agent=hybrid_agent
+        base_vec_env = DummyVecEnv([
+            partial(
+                create_phase3_env,
+                env_data,
+                second_data,
+                market_name,
+                config,
+                i,
+                hybrid_agent,
             )
-        base_vec_env = DummyVecEnv([make_env(i) for i in range(config['n_envs'])])
+            for i in range(config['n_envs'])
+        ])
         safe_print("[ENV] Using DummyVecEnv (single process) - hybrid_agent enabled")
 
     base_vec_env = ActionMaskVecEnvWrapper(base_vec_env)
@@ -1200,11 +1286,6 @@ def train_phase3(
     if not registry_ready:
         safe_print("[ENV] [WARN] Hybrid policy will use fallback position/market state data.")
 
-    # Evaluation environment (must match training env wrapper structure)
-    eval_env = DummyVecEnv([lambda: create_phase3_env(env_data, second_data, market_name, config, rank=999, hybrid_agent=None)])
-    eval_env = ActionMaskVecEnvWrapper(eval_env)
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-
     # CRITICAL FIX: Load or create model with hybrid policy (enables LLM during training)
     if continue_training and model_path:
         # Continue from existing Phase 3 model
@@ -1241,15 +1322,43 @@ def train_phase3(
         safe_print(f"[DEBUG] Model created with n_envs={getattr(model, 'n_envs', 'unknown')}")
         safe_print(f"[DEBUG] About to start learning with train_env.n_envs={train_env.num_envs}")
 
-    # Recreate evaluation environment with hybrid agent
-    eval_env = DummyVecEnv([lambda: create_phase3_env(env_data, second_data, market_name, config, rank=999, hybrid_agent=hybrid_agent)])
-    eval_env = ActionMaskVecEnvWrapper(eval_env)
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    # Build evaluation environment with shared normalization
+    eval_env = build_eval_env(
+        env_data,
+        second_data,
+        market_name,
+        config,
+        train_env,
+        hybrid_agent=hybrid_agent,
+    )
 
     safe_print("[ENV] Hybrid agent communication channels established")
 
     # Create callbacks
-    callbacks, checkpoint_manager = create_callbacks(model, eval_env, hybrid_agent, market_name, config)
+    callbacks, checkpoint_manager, metric_tracker = create_callbacks(
+        model, eval_env, hybrid_agent, market_name, config
+    )
+
+    # Optional sanity-check evaluation before full training
+    sanity_episodes = int(config.get('sanity_eval_episodes', 0) or 0)
+    if sanity_episodes > 0:
+        safe_print(f"[EVAL] Running sanity-check evaluation ({sanity_episodes} episodes)...")
+        try:
+            episode_rewards, _ = evaluate_policy(
+                model,
+                eval_env,
+                n_eval_episodes=sanity_episodes,
+                deterministic=True,
+                return_episode_rewards=True,
+            )
+            rewards = np.asarray(episode_rewards, dtype=np.float64)
+            mean_reward = float(np.mean(rewards))
+            std_reward = float(np.std(rewards))
+            safe_print(f"[EVAL] Sanity reward: {mean_reward:.2f} +/- {std_reward:.2f}")
+            tracker_locals = {'episode_rewards': rewards, 'model': model}
+            metric_tracker.update(tracker_locals, {})
+        except Exception as exc:
+            safe_print(f"[EVAL] Sanity evaluation failed: {exc}")
 
     # Training
     safe_print("=" * 70)

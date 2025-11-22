@@ -54,7 +54,7 @@ except (TypeError, ValueError):
 from sb3_contrib import MaskablePPO  # Using MaskablePPO for action masking
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, CallbackList
+from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
 
 # IMPORT PHASE 1 ENVIRONMENT
 from environment_phase1 import TradingEnvironmentPhase1
@@ -71,6 +71,7 @@ from checkpoint_retention import CheckpointRetentionManager
 # SELF-CORRECTING SYSTEM
 from self_correcting_init import init_self_correcting_system
 from action_mask_utils import ActionMaskVecEnvWrapper, ActionMaskGymnasiumWrapper
+from training_mode_utils import tune_eval_schedule
 
 # Set UTF-8 encoding for Windows compatibility
 if os.name == 'nt':
@@ -193,6 +194,8 @@ PHASE1_CONFIG = {
     # Evaluation - IMPROVED: More frequent and better coverage
     'eval_freq': 100_000,  # Every 100K steps (10M / 100K = 100 evaluations)
     'n_eval_episodes': 10,
+    'eval_interval_updates': 6,  # Target evaluations every ~6 PPO updates
+    'min_eval_episodes': 8,
 
     # Early stopping - More patient for 10M timestep training
     'use_early_stopping': True,
@@ -404,6 +407,7 @@ def train_phase1(
         safe_print("PHASE 1: FOUNDATIONAL TRADING PATTERNS")
         safe_print("=" * 80)
         safe_print("[TRAINING APPROACH]")
+
         safe_print("  ✓ Simplified reward function (entry quality focus)")
         safe_print("  ✓ Relaxed constraints (trailing DD: $5K → $15K)")
         safe_print("  ✓ Disabled daily loss limit for Phase 1")
@@ -411,6 +415,15 @@ def train_phase1(
         safe_print("  ✓ Enhanced exploration (ent_coef: 0.01 → 0.02)")
         safe_print("  ✓ Increased patience (early stopping: 5 → 8 evals)")
         safe_print("=" * 80)
+
+    tune_eval_schedule(
+        PHASE1_CONFIG,
+        test_mode=test_mode,
+        label="Phase 1",
+        eval_updates=PHASE1_CONFIG.get('eval_interval_updates', 6),
+        min_eval_episodes=PHASE1_CONFIG.get('min_eval_episodes', 8),
+        printer=safe_print,
+    )
 
     # Detect and select market
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -612,14 +625,8 @@ def train_phase1(
     metric_tracker.set_seed(42)  # Match training seed
 
     # Create metric hook to update tracker after each evaluation
-    metric_hook = EvalMetricHook(metric_tracker)
-
-    # Combine early stopping and metric tracking using CallbackList
-    # If early_stop_callback is None, only use metric_hook
-    if early_stop_callback is not None:
-        after_eval_callback = CallbackList([early_stop_callback, metric_hook])
-    else:
-        after_eval_callback = metric_hook
+    extra_callbacks = [early_stop_callback] if early_stop_callback is not None else None
+    metric_hook = EvalMetricHook(metric_tracker, extra_callbacks=extra_callbacks)
 
     eval_callback = EvalCallback(
         eval_env,
@@ -630,7 +637,7 @@ def train_phase1(
         deterministic=True,
         render=False,
         verbose=1,
-        callback_after_eval=after_eval_callback
+        callback_after_eval=metric_hook
     )
 
     # IMPROVED: Dynamic checkpoint manager with adaptive intervals and event-driven saves
@@ -641,7 +648,7 @@ def train_phase1(
         config_path='config/checkpoint_config.yaml',
         metric_tracker=metric_tracker,
         target_timesteps=PHASE1_CONFIG['total_timesteps'],
-        verbose=True,
+        verbose=False,
         registry=registry  # Connect to global registry
     )
     safe_print(f"[CHECKPOINT] Dynamic checkpoint manager initialized")

@@ -54,7 +54,7 @@ from sb3_contrib.common.maskable import utils as sb3_maskable_utils
 import sb3_contrib.ppo_mask.ppo_mask as sb3_ppo_mask_module
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement, CallbackList
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
 from environment_phase2 import TradingEnvironmentPhase2
 from kl_callback import KLDivergenceCallback
 from feature_engineering import add_market_regime_features
@@ -65,7 +65,9 @@ from action_mask_utils import (
     ActionMaskGymnasiumWrapper,
     ActionMaskVecEnvWrapper,
     get_action_masks as local_action_masks,
+    phase2_mask_fn,
 )
+from training_mode_utils import tune_eval_schedule
 
 # CHECKPOINT MANAGEMENT
 from checkpoint_manager import DynamicCheckpointManager, MetricTrackingEvalCallback, EvalMetricHook
@@ -168,62 +170,7 @@ def log_action_mask_shape(env, expected_actions: int, label: str = "ENV") -> Non
     safe_print(f"[{label}] Mask shape verified: {masks.shape}")
 
 
-def mask_fn(env):
-    """
-    Resolve the innermost environment that exposes action_masks() and call it directly.
-    CRITICAL FIX: Prioritize TradingEnvironmentPhase2.action_masks() which returns 6-action masks.
-    """
-    from environment_phase2 import TradingEnvironmentPhase2
-    
-    # First, try to find the TradingEnvironmentPhase2 instance directly
-    current = env
-    visited = set()
-    
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
-        
-        # Check if this is the Phase2 environment
-        if isinstance(current, TradingEnvironmentPhase2):
-            masks = current.action_masks()
-            if masks is not None:
-                result = np.asarray(masks, dtype=bool)
-                # Verify we got 6 actions
-                if result.shape == (6,):
-                    return result
-                else:
-                    safe_print(f"[WARN] Phase2 env returned unexpected mask shape: {result.shape}")
-        
-        # Try unwrapped attribute (Gymnasium pattern)
-        unwrapped = getattr(current, "unwrapped", None)
-        if unwrapped and isinstance(unwrapped, TradingEnvironmentPhase2):
-            masks = unwrapped.action_masks()
-            if masks is not None:
-                result = np.asarray(masks, dtype=bool)
-                if result.shape == (6,):
-                    return result
-        
-        # Move to next wrapper layer
-        current = getattr(current, "env", None)
-    
-    # Fallback: Try generic action_masks method (but verify shape)
-    current = env
-    visited.clear()
-    
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
-        action_masks_fn = getattr(current, "action_masks", None)
-        if callable(action_masks_fn):
-            masks = action_masks_fn()
-            if masks is not None:
-                result = np.asarray(masks, dtype=bool)
-                # Only accept if it's 6 actions
-                if result.shape == (6,):
-                    return result
-        current = getattr(current, "env", None)
-    
-    # Last resort: Return all actions valid for 6-action space
-    safe_print("[WARN] Could not find Phase2 action_masks, returning all valid")
-    return np.ones(6, dtype=bool)
+mask_fn = phase2_mask_fn
 
 
 def stable_mask_fetch(env) -> np.ndarray:
@@ -343,8 +290,12 @@ PHASE2_CONFIG = {
     'commission_override': None,  # None = use market default, or set custom value (e.g., 1.50)
 
     # Evaluation - More frequent for better early stopping
-    'eval_freq': 50_000,  # Every 50K = 100 evals max (5M / 50K)
+    'eval_freq': 50_000,  # Base frequency before auto-scaling
     'n_eval_episodes': 10,  # Better estimate of true performance
+    'eval_min_episode_bars': 2_000,
+    'eval_randomize_start_offsets': False,
+    'eval_interval_updates': 4,  # Target: once every 4 PPO updates in production
+    'min_eval_episodes': 8,
 
     # Early stopping - Aggressive to prevent overfitting with limited data
     'use_early_stopping': True,
@@ -1067,6 +1018,15 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
     safe_print("PHASE 2: POSITION MANAGEMENT MASTERY")
     safe_print("=" * 80)
 
+    tune_eval_schedule(
+        PHASE2_CONFIG,
+        test_mode=test_mode,
+        label="Phase 2",
+        eval_updates=PHASE2_CONFIG.get('eval_interval_updates', 4),
+        min_eval_episodes=PHASE2_CONFIG.get('min_eval_episodes', 8),
+        printer=safe_print,
+    )
+
     # Detect and select market
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(script_dir, 'data')
@@ -1165,8 +1125,11 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
             position_size_contracts=PHASE2_CONFIG['position_size'],
             trailing_drawdown_limit=PHASE2_CONFIG['trailing_dd_limit'],
             start_index=PHASE2_CONFIG['window_size'],
-            randomize_start_offsets=False,
-            min_episode_bars=PHASE2_CONFIG.get('min_episode_bars', 1500)
+            randomize_start_offsets=PHASE2_CONFIG.get('eval_randomize_start_offsets', False),
+            min_episode_bars=PHASE2_CONFIG.get(
+                'eval_min_episode_bars',
+                PHASE2_CONFIG.get('min_episode_bars', 1500),
+            )
         )
         wrapped_env = ActionMaskGymnasiumWrapper(base_env)
         monitored_env = Monitor(wrapped_env)
@@ -1255,14 +1218,8 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
     metric_tracker.set_seed(42)  # Match training seed
 
     # Create metric hook to update tracker after each evaluation
-    metric_hook = EvalMetricHook(metric_tracker)
-
-    # Combine early stopping and metric tracking using CallbackList
-    # If early_stop_callback is None, only use metric_hook
-    if early_stop_callback is not None:
-        after_eval_callback = CallbackList([early_stop_callback, metric_hook])
-    else:
-        after_eval_callback = metric_hook
+    extra_callbacks = [early_stop_callback] if early_stop_callback is not None else None
+    metric_hook = EvalMetricHook(metric_tracker, extra_callbacks=extra_callbacks)
 
     eval_callback = EvalCallback(
         eval_env,
@@ -1273,7 +1230,7 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
         deterministic=True,
         render=False,
         verbose=1,
-        callback_after_eval=after_eval_callback
+        callback_after_eval=metric_hook
     )
 
     # IMPROVED: Dynamic checkpoint manager with adaptive intervals and event-driven saves
@@ -1284,7 +1241,7 @@ def train_phase2(market_override=None, non_interactive=False, test_mode=False):
         config_path='config/checkpoint_config.yaml',
         metric_tracker=metric_tracker,
         target_timesteps=PHASE2_CONFIG['total_timesteps'],
-        verbose=True,
+        verbose=False,
         registry=registry  # Connect to global registry
     )
     safe_print(f"[CHECKPOINT] Dynamic checkpoint manager initialized")
@@ -1434,8 +1391,10 @@ if __name__ == '__main__':
         safe_print("=" * 80)
         PHASE2_CONFIG['total_timesteps'] = 50_000  # Small test run
         PHASE2_CONFIG['num_envs'] = 4  # Minimal for local CPU/small GPU
-        PHASE2_CONFIG['eval_freq'] = 10_000  # Eval 5 times
-        PHASE2_CONFIG['n_eval_episodes'] = 3  # Faster eval
+        PHASE2_CONFIG['eval_freq'] = 50_000  # Single evaluation near the end
+        PHASE2_CONFIG['n_eval_episodes'] = 1  # Minimal eval overhead
+        PHASE2_CONFIG['eval_min_episode_bars'] = 800
+        PHASE2_CONFIG['eval_randomize_start_offsets'] = True  # Short randomized evals
 
         # Disable early stopping in test mode (run full 50K)
         PHASE2_CONFIG['use_early_stopping'] = False

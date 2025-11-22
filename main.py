@@ -455,10 +455,25 @@ class RLTrainerMenu:
         try:
             # Handle package names with version specifiers
             pkg = package_name.split('>=')[0].split('==')[0].split('<')[0].strip()
-            # Handle special cases
-            if pkg == 'sb3-contrib':
-                pkg = 'sb3_contrib'
-            __import__(pkg)
+            
+            # Map package names to their import names
+            # (requirements.txt name -> Python import name)
+            package_name_mapping = {
+                'pyyaml': 'yaml',
+                'ipython': 'IPython',
+                'stable-baselines3': 'stable_baselines3',
+                'sb3-contrib': 'sb3_contrib',
+                'scikit-learn': 'sklearn',
+                'pillow': 'PIL',
+                'opencv-python': 'cv2',
+                'python-dateutil': 'dateutil',
+                'attrs': 'attr',
+            }
+            
+            # Use mapped name if available, otherwise use the package name with hyphens replaced by underscores
+            import_name = package_name_mapping.get(pkg.lower(), pkg.replace('-', '_'))
+            
+            __import__(import_name)
             return True
         except ImportError:
             return False
